@@ -70,6 +70,50 @@ contract DeezFlywheelTest is DeezBase {
         assertEq(rewards.claimable(alice, epoch + 1), 0, "nothing was traded in the next epoch");
     }
 
+    function test_earlyClaimerGetsItsShareOfFeesHarvestedLater() public {
+        // The review's scenario: half the day's fees are harvested at noon, the other half are still in the
+        // hook when alice claims right after the day ends. Her claim harvests them, so she is paid her share
+        // of the whole day in one go, and a later harvest() or second claim changes nothing for her.
+        vm.warp(1_000 * 1 days);
+        seedBalanced(1_000_000 ether);
+        token.transfer(alice, 75_000_000 ether);
+        token.transfer(bob, 25_000_000 ether);
+        token.transfer(address(manager), token.balanceOf(address(this)));
+        uint256 epoch = rewards.currentEpoch();
+
+        vm.warp(1_000 * 1 days + 12 hours);
+        buy(-5_000 ether);
+        hook.harvest();
+        vm.warp(1_000 * 1 days + 23 hours);
+        buy(-5_000 ether);
+        uint256 pending = hook.pendingFeesOf(epoch);
+        assertEq(pending, 100 ether);
+
+        vm.warp((epoch + 1) * 1 days);
+        uint256 supply = rewards.eligibleSupplyAt(epoch);
+        uint256 owedAlice = 200 ether * rewards.weightOf(alice, epoch) / supply;
+        assertEq(rewards.claimable(alice, epoch), owedAlice, "claimable counts the unharvested fees");
+        uint256[] memory list = new uint256[](1);
+        list[0] = epoch;
+        vm.prank(alice);
+        uint256 paidAlice = rewards.claim(alice, list);
+        assertEq(paidAlice, owedAlice, "paid her share of every fee of the epoch at once");
+        assertEq(hook.pendingFeesOf(epoch), 0, "the claim harvested the epoch");
+        (uint128 total,,,) = rewards.pots(epoch);
+        assertEq(total, 200 ether);
+
+        assertEq(hook.harvest(), 0, "nothing left to harvest");
+        assertEq(rewards.claimable(alice, epoch), 0);
+        vm.prank(alice);
+        vm.expectRevert(DeezRewards.NothingToClaim.selector);
+        rewards.claim(alice, list);
+        vm.prank(bob);
+        uint256 paidBob = rewards.claim(bob, list);
+        assertEq(paidBob, 200 ether * rewards.weightOf(bob, epoch) / supply);
+        assertApproxEqAbs(paidAlice, 3 * paidBob, 3, "three times the bag, three times the share");
+        assertEq(imd.balanceOf(alice), paidAlice);
+    }
+
     function test_lastSecondBuyerCannotSnipeTheEpochsPot() public {
         // The scenario from the review: fees sit unharvested, a sniper buys one second before the epoch ends,
         // harvests, sells right after the boundary and claims. With fees credited to the epoch of the trade and

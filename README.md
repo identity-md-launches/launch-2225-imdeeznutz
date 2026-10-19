@@ -103,13 +103,20 @@ harvests and whenever. `harvestEpochs(uint256[])` does the same for any older ep
 - `eligibleSupplyAt(e) = averageTotalSupply − weightOf(PoolManager) − weightOf(0x…dEaD) − weightOf(hook) −
   weightOf(rewards)` over the epoch. The PoolManager is where the pool's $DEEZ lives (Uniswap v4 is a
   singleton), so "the pool / LP position" is excluded as the brief asks.
-- `claimable(account, e) = pots[e].total × weightOf(account, e) / eligibleSupplyAt(e)`. Bigger bags get
-  proportionally more; there is no cutoff and no minimum. A share is capped at what is left in the pot, so
-  the per-checkpoint rounding of the token's cumulative balances (one wei-day per segment) can never make
-  the pot pay out more than it holds.
+- `claimable(account, e) = (pots[e].total + hook.pendingFeesOf(e)) × weightOf(account, e) /
+  eligibleSupplyAt(e) − paidOf[e][account]`: the account's share of every fee of the epoch, harvested or
+  not, minus what it was already paid for that epoch. Bigger bags get proportionally more; there is no
+  cutoff and no minimum. A share is capped at what is left in the pot, so the per-checkpoint rounding of the
+  token's cumulative balances (one wei-day per segment) can never make the pot pay out more than it holds.
 - `claim(account, epochs[])` pays `account` for each listed ended epoch and may only be called by `account`
   itself (`NotAccount` otherwise), so no third party can push a share into a contract that cannot move it.
-  Double claims, excluded addresses, un-ended epochs and empty claims revert.
+  It first calls `hook.harvestEpochs(epochs)`, so fees traded in the epoch after its last harvest are
+  credited to the pot before the share is computed, and records what it paid in `paidOf[e][account]`. A
+  pot can only grow (a late harvest, a redirected credit), never shrink, so a repeat claim of an epoch pays
+  the difference between the share of the grown pot and what was paid, and nothing when there is none. A
+  holder therefore ends with exactly its share of the whole epoch whenever it claims, early or late, in one
+  claim or several. Excluded addresses, un-ended epochs, recycled epochs and claims that pay nothing in
+  total revert.
 - `recycle(e)`, after `CLAIM_WINDOW = 90` epochs, folds whatever was never claimed for `e` into the current
   pot and closes `e`. This keeps $IMD from being stranded by holders that never claim (abandoned wallets,
   contracts that hold $DEEZ but have no way to call `claim`, such as the swarm's Merkle distributor while its
@@ -144,7 +151,11 @@ owner and no fee collection, so the liquidity and its LP fees stay in the pool f
    `DeezRewards.recycle(epoch)` are permissionless; `DeezRewards.claim(holder, epochs)` is called by the
    holder. Nothing runs by itself: somebody (any holder, a keeper, the site's buttons) has to send those
    transactions. A claim for an epoch needs the epoch to have ended (UTC day boundary). Fees not harvested
-   within a day of trading are still credited to their own epoch; `harvestEpochs` picks them up.
+   within a day of trading are still credited to their own epoch; `harvestEpochs` picks them up, and so does
+   `claim` for the epochs it pays, so a holder never has to harvest before claiming. If the pair token ever
+   refused the transfer into `DeezRewards`, a claim of an epoch with unharvested fees would revert with it
+   (nothing is lost; the claim works again once the transfer does), while epochs with nothing pending are
+   unaffected.
 3. **Website.** `site/` is a static single page (`index.html`, `deez.config.js`, `logo.svg`). Fill
    `deez.config.js` with the launched addresses, the pool id, the launch tx and the Uniswap / DexScreener
    URLs, then publish the folder to sites.imd.fun (or pin to IPFS and point an ENS name at it). The page
@@ -218,7 +229,10 @@ never the swap amount, and `HookDeltaExceedsSwapAmount` in v4-core bounds it.
 - Delta accounting: the hook's delta per swap is `+fee` (returned) and `−fee` (minted claim) = 0. Harvest
   burns `+amount` and takes `−amount` = 0. Tests assert the claims are fully backed by $IMD.
 - Reentrancy: `claim` is `nonReentrant`; the hook holds no tokens; the lock's `unlockCallback` is
-  manager-only. $IMD is a standard OFT ERC-20 without transfer callbacks.
+  manager-only. $IMD is a standard OFT ERC-20 without transfer callbacks. `claim` makes one external call
+  before it writes state, `hook.harvestEpochs`, to the immutable hook the distributor was constructed with;
+  that call can only re-enter through `accrue` and `credit` (`credit` is hook-only and backed by the $IMD
+  actually delivered), both of which `claim` accounts for before computing any share.
 - The reward token is $IMD, whose contract is owned by its own project (LayerZero OFT admin). If $IMD ever
   froze transfers, fee-bearing swaps would still succeed (the fee is a claim), harvest and claims would wait.
 - The swarm's Merkle distributor holds up to 10% of supply and is not excluded: its address is unknown at
@@ -243,16 +257,18 @@ FOUNDRY_FUZZ_SEED=0xc0b32088ed4ea538fc6eb66714ec1bd09394ca1049d6a3df1c8591aba01b
 forge fmt --check
 ```
 
-113 tests across `test/`: token metadata, supply, transfers, checkpoint history and cumulative (time-
+117 tests across `test/`: token metadata, supply, transfers, checkpoint history and cumulative (time-
 weighted) balances; hook permissions, initialization refusals, caller checks, the four fee cases (both
 currency orders, fuzzed), partial fills refused on the $IMD-specified cases and charged correctly on the
 $DEEZ-specified ones, a buy on a fresh PoolManager seeded with $DEEZ only, per-epoch harvest, zero-liquidity
 collects; distributor accrual and hook credits, proportional and time-weighted claims, self-only claims,
-exclusions, double/early/empty claims, recycling, fuzzed conservation with mid-epoch moves; the liquidity
-lock in every mode, with dust on the other side and with a tick bound; and end-to-end trade → harvest →
-claim flows including the last-second-buyer scenario. The pinned floor suites (hook, owners, token) were
-rehearsed locally against the built creation code and pass. `test/mocks/` holds the `MockERC20` and
-`Swapper` the floor imports; `src/HookFlags.sol` is the flag library it imports.
+exclusions, early/empty/repeat claims, claims that harvest the epoch's pending fees first, a late credit
+paid on a second claim, recycling, fuzzed conservation with mid-epoch moves; the liquidity lock in every
+mode, with dust on the other side and with a tick bound; and end-to-end trade → harvest → claim flows
+including the last-second-buyer and the early-claimer scenarios. The pinned floor suites (hook, owners,
+token) were rehearsed locally against the built creation code and pass. `test/mocks/` holds the
+`MockERC20` and `Swapper` the floor imports and the `MockHook` the distributor's unit tests use;
+`src/HookFlags.sol` is the flag library the floor imports.
 
 ## Revision history
 
@@ -268,6 +284,16 @@ Review round 1 (2026-10-19) reopened the work with these findings, all reproduce
   cumulative balance history, not the balance at the last second.
 - **Lock mode from mutable state** (low): `lockAs(mode, minTick, maxTick)` with explicit modes and a tick
   bound; `lock()` kept as the convenience form.
+
+Review round 2 (2026-10-19) reopened it with one finding, reproduced and fixed here:
+
+- **Early claimers lost fees harvested into the epoch later** (medium): with per-epoch crediting, fees
+  traded after an epoch's last harvest reached its pot only at the next `harvest()`, and `claimed` was a
+  one-shot flag, so a holder who claimed before that harvest could never collect its share of them.
+  `claim` now harvests the listed epochs through the hook before paying, and `paidOf[epoch][account]`
+  replaces the flag so a repeat claim pays the difference against the grown pot. `claimable` counts the
+  hook's `pendingFeesOf(epoch)` so it shows what a claim pays. `AlreadyClaimed` is gone: a claim that pays
+  nothing in total reverts `NothingToClaim`.
 
 Dependencies are vendored as plain files under `lib/` (v4-core at commit `46c6834`, forge-std, OpenZeppelin
 Contracts v5.1.0, solmate's `Owned.sol` for v4-core's `ProtocolFees`); no submodules.

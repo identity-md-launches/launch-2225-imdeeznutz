@@ -33,7 +33,8 @@ import {DeezLiquidityLock} from "./DeezLiquidityLock.sol";
 /// balance in the PoolManager (a launch pool is seeded with $DEEZ only) and can never make a swap revert
 /// because a recipient refused it. Fees are recorded against the reward epoch they were traded in; anyone may
 /// call `harvest()` to burn the claims, move the $IMD into `DeezRewards` and credit each epoch's own pot, so
-/// nobody can choose which day's holders a fee goes to by timing the harvest.
+/// nobody can choose which day's holders a fee goes to by timing the harvest. `DeezRewards.claim` calls
+/// `harvestEpochs` for the epochs it pays, so a claim never misses fees of the day that were still unharvested.
 ///
 /// No owner, no settable parameter, no pause: the hook has no admin surface. It has no liquidity callbacks,
 /// so the launch factory's fee collect (a zero liquidity change) is never touched.
@@ -202,7 +203,8 @@ contract DeezHook is IHooks, IUnlockCallback {
         return _harvest(epochs);
     }
 
-    /// @notice Harvest the fees traded in `epochs`, each credited to its own pot. Anyone may call this.
+    /// @notice Harvest the fees traded in `epochs`, each credited to its own pot. Anyone may call this;
+    /// `DeezRewards.claim` does, for the epochs it pays.
     function harvestEpochs(uint256[] calldata epochs) external returns (uint256 amount) {
         return _harvest(epochs);
     }

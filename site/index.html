@@ -115,7 +115,7 @@
       <div class="tile"><h3>1. Trade</h3><p>Every swap in the $DEEZ/$IMD Uniswap v4 pool passes through the DEEZ hook. The hook takes exactly 2% of the $IMD side: from what you pay on a buy, from what you receive on a sell. The $DEEZ token itself is a plain ERC-20 with no transfer tax.</p></div>
       <div class="tile"><h3>2. Accumulate</h3><p>The fee is held inside the PoolManager as an ERC-6909 claim, recorded against the UTC day it was traded in. Anyone can call <code>harvest()</code> on the hook to move the accumulated $IMD into the rewards contract; each day's fees land in that day's pot, whenever the harvest happens.</p></div>
       <div class="tile"><h3>3. Weigh</h3><p>At the end of each UTC day the token's own balance history fixes each wallet's average balance over the day. The pool, the burn address and the protocol contracts are excluded; every other wallet counts, with no top-N cutoff.</p></div>
-      <div class="tile"><h3>4. Claim</h3><p>Your share of a day's pot is <code>pot × your average balance ÷ eligible supply</code>. You claim your own share from your own wallet; the $IMD goes to you. Shares unclaimed for 90 days are recycled into the current pot.</p></div>
+      <div class="tile"><h3>4. Claim</h3><p>Your share of a day's pot is <code>pot × your average balance ÷ eligible supply</code>. You claim your own share from your own wallet; the $IMD goes to you. A claim harvests the day's still-pending fees first, so you are paid your share of the whole day whenever you claim. Shares unclaimed for 90 days are recycled into the current pot.</p></div>
     </div>
   </section>
 
@@ -166,7 +166,7 @@
           <li>Open the rewards contract on Etherscan and read <code>currentEpoch()</code>.</li>
           <li>For any ended epoch, read <code>claimable(yourAddress, epoch)</code>.</li>
           <li>Write <code>claim(yourAddress, [epochs…])</code> from that same wallet; the $IMD is sent to <code>yourAddress</code>.</li>
-          <li>If the pot looks small, call <code>harvest()</code> on the hook first: it moves the collected fees of today and yesterday into their epochs (<code>harvestEpochs</code> for older days).</li>
+          <li>No need to harvest first: <code>claimable</code> already counts the day's fees still held by the hook, and <code>claim</code> harvests them before paying. <code>harvest()</code> on the hook remains open to anyone who wants to move today's and yesterday's fees into their pots early.</li>
         </ol>
       </div>
     </div>

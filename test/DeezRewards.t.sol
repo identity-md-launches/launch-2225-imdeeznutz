@@ -5,11 +5,12 @@ import {Test} from "forge-std/Test.sol";
 import {DeezToken} from "../src/DeezToken.sol";
 import {DeezRewards} from "../src/DeezRewards.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockHook} from "./mocks/MockHook.sol";
 
 /// @dev Stands in for the swarm's Merkle distributor or any other contract that holds $DEEZ and cannot claim.
 contract HoldingContract {}
 
-/// @notice Unit tests of the distributor alone, with stand-in pool manager and hook addresses.
+/// @notice Unit tests of the distributor alone, with a stand-in pool manager address and a mock hook.
 contract DeezRewardsTest is Test {
     uint256 constant EPOCH = 1 days;
     uint256 constant SUPPLY = 1e27;
@@ -17,9 +18,10 @@ contract DeezRewardsTest is Test {
     DeezToken token;
     MockERC20 imd;
     DeezRewards rewards;
+    MockHook mockHook;
 
     address poolManager = address(0x9001);
-    address hook = address(0x9002);
+    address hook;
     address alice = address(0xA11CE);
     address bob = address(0xB0B);
     address carol = address(0xCA201);
@@ -29,7 +31,10 @@ contract DeezRewardsTest is Test {
         vm.warp(100 * EPOCH); // the first second of epoch 100: everything below holds for the whole epoch
         token = new DeezToken();
         imd = new MockERC20("IMD", "IMD", 0);
+        mockHook = new MockHook();
+        hook = address(mockHook);
         rewards = new DeezRewards(address(token), address(imd), poolManager, hook);
+        mockHook.init(imd, rewards);
     }
 
     function fund(uint256 amount) internal {
@@ -245,20 +250,77 @@ contract DeezRewardsTest is Test {
         assertEq(rewards.claimable(alice, 100), 0);
     }
 
-    function test_doubleClaimReverts() public {
+    function test_doubleClaimPaysNothingMore() public {
         token.transfer(alice, 100 ether);
+        token.transfer(bob, 100 ether);
         fund(100 ether);
         vm.warp(101 * EPOCH);
-        claimAs(alice, 100);
+        uint256 paid = claimAs(alice, 100);
+        assertEq(rewards.paidOf(100, alice), paid);
+        assertEq(rewards.claimable(alice, 100), 0, "nothing left for alice");
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(DeezRewards.AlreadyClaimed.selector, 100, alice));
+        vm.expectRevert(DeezRewards.NothingToClaim.selector);
         rewards.claim(alice, epochs(100));
+        // The same epoch twice in one batch pays it once.
         uint256[] memory twice = new uint256[](2);
         twice[0] = 100;
         twice[1] = 100;
         vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(DeezRewards.AlreadyClaimed.selector, 100, bob));
-        rewards.claim(bob, twice);
+        assertEq(rewards.claim(bob, twice), paid, "same bag, same share, paid once");
+        assertEq(imd.balanceOf(bob), paid);
+        (, uint128 claimedAmount,,) = rewards.pots(100);
+        assertEq(claimedAmount, 2 * paid);
+    }
+
+    function test_lateCreditIsPaidOnASecondClaim() public {
+        // Fees of epoch 100 can reach the pot after a holder claimed it (harvested later by someone else).
+        token.transfer(alice, 300 ether);
+        token.transfer(bob, 100 ether);
+        token.transfer(poolManager, SUPPLY - 400 ether);
+        vm.warp(100 * EPOCH + 12 hours);
+        creditAsHook(100, 100 ether);
+        vm.warp(101 * EPOCH);
+        assertEq(claimAs(alice, 100), 75 ether);
+        creditAsHook(100, 100 ether); // the rest of the day's fees, harvested after alice claimed
+        (uint128 total,,,) = rewards.pots(100);
+        assertEq(total, 200 ether);
+        assertEq(rewards.claimable(alice, 100), 75 ether, "the difference against the grown pot");
+        assertEq(rewards.claimable(bob, 100), 50 ether, "bob never claimed: his whole share");
+        assertEq(claimAs(alice, 100), 75 ether);
+        assertEq(imd.balanceOf(alice), 150 ether, "alice ends with her share of every fee of the epoch");
+        assertEq(rewards.paidOf(100, alice), 150 ether);
+        assertEq(claimAs(bob, 100), 50 ether);
+        assertEq(rewards.reserved(), 0);
+    }
+
+    function test_claimHarvestsThePendingFeesOfTheEpochFirst() public {
+        token.transfer(alice, 300 ether);
+        token.transfer(bob, 100 ether);
+        token.transfer(poolManager, SUPPLY - 400 ether);
+        creditAsHook(100, 100 ether); // harvested during the day
+        mockHook.setPending(100, 100 ether); // traded after that harvest, still in the hook
+        vm.warp(101 * EPOCH);
+        assertEq(rewards.claimable(alice, 100), 150 ether, "claimable counts the unharvested fees too");
+        assertEq(claimAs(alice, 100), 150 ether, "one claim pays alice's share of every fee of the epoch");
+        assertEq(mockHook.harvestCalls(), 1);
+        assertEq(mockHook.pendingFeesOf(100), 0);
+        (uint128 total,,,) = rewards.pots(100);
+        assertEq(total, 200 ether, "the pending fees were credited to the epoch by the claim");
+        assertEq(rewards.claimable(alice, 100), 0);
+        assertEq(claimAs(bob, 100), 50 ether);
+        assertEq(rewards.reserved(), 0);
+    }
+
+    function test_claimHarvestsOnlyTheEpochsItPays() public {
+        token.transfer(alice, 100 ether);
+        token.transfer(poolManager, SUPPLY - 100 ether);
+        mockHook.setPending(100, 10 ether);
+        mockHook.setPending(101, 20 ether);
+        vm.warp(102 * EPOCH);
+        assertEq(claimAs(alice, 100), 10 ether);
+        assertEq(mockHook.pendingFeesOf(100), 0);
+        assertEq(mockHook.pendingFeesOf(101), 20 ether, "epoch 101 was not listed, so not harvested");
+        assertEq(rewards.claimable(alice, 101), 20 ether);
     }
 
     function test_excludedAddressesCannotClaim() public {
