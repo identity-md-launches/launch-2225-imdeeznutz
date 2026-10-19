@@ -5,9 +5,11 @@ import {Test} from "forge-std/Test.sol";
 import {DeezToken} from "../src/DeezToken.sol";
 import {DeezRewards} from "../src/DeezRewards.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockHook} from "./mocks/MockHook.sol";
 
 /// @notice Drives the distributor in random order: holders move $DEEZ (also into and out of the excluded pool),
-/// $IMD arrives with and without `accrue`, time passes (sometimes past the claim window), holders claim, third
+/// $IMD arrives with and without `accrue`, the hook holds unharvested fees of past and current epochs (which a
+/// claim harvests, or anyone does), time passes (sometimes past the claim window), holders claim, third
 /// parties try to claim for them, epochs are finalized and recycled. Ghosts record what went in and what came out.
 contract RewardsHandler is Test {
     uint256 internal constant EPOCH = 1 days;
@@ -15,6 +17,7 @@ contract RewardsHandler is Test {
     DeezToken public token;
     MockERC20 public imd;
     DeezRewards public rewards;
+    MockHook public hook;
     address public poolManager;
 
     address[] public actors;
@@ -27,6 +30,8 @@ contract RewardsHandler is Test {
     mapping(address => uint256) public ghostPaidTo;
     uint256 public ghostClaims;
     uint256 public ghostRecycles;
+    /// @dev Unharvested fees the hook still holds, per epoch, summed: minted to the distributor only on harvest.
+    uint256 public ghostPending;
     /// @dev Set when a claim paid more than the claimant's balance share of the pot.
     bool public overpaid;
     /// @dev Set when a claim or recycle reopened an epoch that was already closed.
@@ -38,12 +43,14 @@ contract RewardsHandler is Test {
         DeezToken token_,
         MockERC20 imd_,
         DeezRewards rewards_,
+        MockHook hook_,
         address poolManager_,
         address[] memory actors_
     ) {
         token = token_;
         imd = imd_;
         rewards = rewards_;
+        hook = hook_;
         poolManager = poolManager_;
         actors = actors_;
     }
@@ -93,6 +100,26 @@ contract RewardsHandler is Test {
         }
     }
 
+    /// @dev A fee traded in `epoch` (past or current) that the hook has not harvested yet.
+    function lateFee(uint256 epochSeed, uint256 amount) external {
+        uint256 epoch = _epoch(epochSeed);
+        amount = bound(amount, 0, 1e30);
+        hook.setPending(epoch, hook.pendingFeesOf(epoch) + amount);
+        ghostPending += amount;
+        _touch(epoch);
+    }
+
+    /// @dev Anyone harvests the hook's pending fees of some epochs.
+    function harvest(uint256 epochSeed) external {
+        uint256[] memory list = new uint256[](1);
+        list[0] = _epoch(epochSeed);
+        uint256 pending = hook.pendingFeesOf(list[0]);
+        hook.harvestEpochs(list);
+        ghostPending -= pending;
+        ghostMinted += pending;
+        _touch(rewards.currentEpoch()); // a closed epoch's late fees are credited to the current one
+    }
+
     function warp(uint256 secs) external {
         secs = bound(secs, 1, 3 days);
         vm.warp(block.timestamp + secs);
@@ -110,22 +137,26 @@ contract RewardsHandler is Test {
         list[0] = epoch;
 
         (uint128 totalBefore, uint128 claimedBefore,, bool closedBefore) = rewards.pots(epoch);
+        uint256 pending = hook.pendingFeesOf(epoch);
         bool ended = rewards.hasEnded(epoch);
         uint256 weight = ended ? rewards.weightOf(account, epoch) : 0;
         uint256 before = imd.balanceOf(account);
+        uint256 paidBefore = rewards.paidOf(epoch, account);
 
         vm.prank(account);
         try rewards.claim(account, list) returns (uint256 paid) {
             if (closedBefore) reopened = true;
-            // `claim` accrues first, which credits the current epoch with any un-accrued $IMD.
+            // `claim` harvests the epoch's pending fees, then accrues un-accrued $IMD to the current epoch.
+            ghostPending -= pending;
+            ghostMinted += pending;
             _touch(rewards.currentEpoch());
-            // Accrue inside claim can only add to the current epoch, which has not ended, so the pot is unchanged.
             (uint128 totalAfter, uint128 claimedAfter, uint256 supply,) = rewards.pots(epoch);
-            assertEq(totalAfter, totalBefore, "an ended pot never grows");
+            assertEq(totalAfter, uint256(totalBefore) + pending, "an ended pot grows only by its harvested fees");
             assertEq(claimedAfter - claimedBefore, paid, "pot claimed tracks the payout");
             assertEq(imd.balanceOf(account) - before, paid, "payout reaches the account");
-            // paid <= pot * averageBalance / eligibleSupply
-            if (supply == 0 || paid * supply > uint256(totalBefore) * weight) overpaid = true;
+            assertEq(rewards.paidOf(epoch, account) - paidBefore, paid, "paidOf tracks the payout");
+            // Everything ever paid for the epoch <= pot * averageBalance / eligibleSupply.
+            if (supply == 0 || (paidBefore + paid) * supply > uint256(totalAfter) * weight) overpaid = true;
             ghostPaid += paid;
             ghostPaidTo[account] += paid;
             ghostClaims++;
@@ -169,14 +200,16 @@ contract DeezRewardsInvariantTest is Test {
     DeezRewards rewards;
     RewardsHandler handler;
     address poolManager = address(0x9001);
-    address hookAddr = address(0x9002);
+    MockHook mockHook;
     address[] actors;
 
     function setUp() public {
         vm.warp(100 days + 7);
         token = new DeezToken();
         imd = new MockERC20("IMD", "IMD", 0);
-        rewards = new DeezRewards(address(token), address(imd), poolManager, hookAddr);
+        mockHook = new MockHook();
+        rewards = new DeezRewards(address(token), address(imd), poolManager, address(mockHook));
+        mockHook.init(imd, rewards);
 
         actors.push(address(0xA11CE));
         actors.push(address(0xB0B));
@@ -188,7 +221,7 @@ contract DeezRewardsInvariantTest is Test {
         token.transfer(actors[2], 5_000_000 ether);
         token.transfer(actors[3], token.balanceOf(address(this)));
 
-        handler = new RewardsHandler(token, imd, rewards, poolManager, actors);
+        handler = new RewardsHandler(token, imd, rewards, mockHook, poolManager, actors);
         targetContract(address(handler));
     }
 
@@ -214,6 +247,31 @@ contract DeezRewardsInvariantTest is Test {
         for (uint256 i = 0; i < n; i++) {
             (uint128 total, uint128 claimed,,) = rewards.pots(handler.touchedEpochs(i));
             assertLe(claimed, total);
+        }
+    }
+
+    function invariant_pendingFeesAreTrackedExactly() public view {
+        uint256 n = handler.touchedCount();
+        uint256 sum;
+        for (uint256 i = 0; i < n; i++) {
+            sum += mockHook.pendingFeesOf(handler.touchedEpochs(i));
+        }
+        assertEq(sum, handler.ghostPending());
+    }
+
+    function invariant_noHolderIsPaidMoreThanItsShareOfAnyPot() public view {
+        uint256 n = handler.touchedCount();
+        for (uint256 i = 0; i < n; i++) {
+            uint256 epoch = handler.touchedEpochs(i);
+            (uint128 total, uint128 claimed, uint256 supply,) = rewards.pots(epoch);
+            uint256 sum;
+            for (uint256 j = 0; j < actors.length; j++) {
+                uint256 paid = rewards.paidOf(epoch, actors[j]);
+                if (paid == 0) continue;
+                sum += paid;
+                assertLe(paid, uint256(total) * rewards.weightOf(actors[j], epoch) / supply);
+            }
+            assertEq(sum, claimed, "a pot's payouts are exactly what its holders were paid");
         }
     }
 

@@ -12,6 +12,7 @@ import {DeezHook} from "../src/DeezHook.sol";
 import {DeezRewards} from "../src/DeezRewards.sol";
 import {DeezLiquidityLock} from "../src/DeezLiquidityLock.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockHook} from "./mocks/MockHook.sol";
 
 /// @notice Edges and refusals of the distributor: window boundaries, batches that mix good and bad epochs,
 /// time-weighted balances at the epoch edges, empty eligible supply, rounding to zero, who may claim.
@@ -24,7 +25,8 @@ contract DeezRewardsFailurePathsTest is Test {
     MockERC20 imd;
     DeezRewards rewards;
     address poolManager = address(0x9001);
-    address hookAddr = address(0x9002);
+    MockHook mockHook;
+    address hookAddr;
     address alice = address(0xA11CE);
     address bob = address(0xB0B);
 
@@ -32,7 +34,10 @@ contract DeezRewardsFailurePathsTest is Test {
         vm.warp(START * EPOCH);
         token = new DeezToken();
         imd = new MockERC20("IMD", "IMD", 0);
+        mockHook = new MockHook();
+        hookAddr = address(mockHook);
         rewards = new DeezRewards(address(token), address(imd), poolManager, hookAddr);
+        mockHook.init(imd, rewards);
         token.transfer(poolManager, 900_000_000 ether);
         token.transfer(alice, 75_000_000 ether);
         token.transfer(bob, 25_000_000 ether);
@@ -82,7 +87,7 @@ contract DeezRewardsFailurePathsTest is Test {
         vm.prank(hookAddr);
         vm.expectRevert(abi.encodeWithSelector(DeezRewards.NotAccount.selector, alice));
         rewards.claim(alice, one(START));
-        assertFalse(rewards.claimed(START, alice));
+        assertEq(rewards.paidOf(START, alice), 0);
         assertEq(claimAs(alice, one(START)), 75 ether);
         assertEq(imd.balanceOf(alice), 75 ether);
         assertEq(imd.balanceOf(bob), 0);
@@ -101,18 +106,92 @@ contract DeezRewardsFailurePathsTest is Test {
         assertEq(rewards.claimable(poolManager, START), 0, "the pool's 90% earns nothing");
     }
 
-    function test_duplicateEpochInOneBatchRevertsTheWholeBatch() public {
+    function test_duplicateEpochInOneBatchPaysItOnce() public {
         fund(100 ether);
         nextEpoch();
+        assertEq(claimAs(alice, two(START, START)), 75 ether, "the repeat pays the difference, which is zero");
+        assertEq(imd.balanceOf(alice), 75 ether);
+        assertEq(rewards.paidOf(START, alice), 75 ether);
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(DeezRewards.AlreadyClaimed.selector, START, alice));
-        rewards.claim(alice, two(START, START));
-        assertEq(imd.balanceOf(alice), 0);
-        assertFalse(rewards.claimed(START, alice), "the reverted batch left nothing behind");
-        assertEq(claimAs(alice, one(START)), 75 ether);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(DeezRewards.AlreadyClaimed.selector, START, alice));
+        vm.expectRevert(DeezRewards.NothingToClaim.selector);
         rewards.claim(alice, one(START));
+        assertEq(rewards.claimable(alice, START), 0);
+    }
+
+    function test_lateFeeAfterSomeClaimedStillSplitsExactlyByBalance() public {
+        fund(100 ether);
+        nextEpoch();
+        assertEq(claimAs(alice, one(START)), 75 ether);
+        // 40 IMD of fees traded in START were still unharvested when alice claimed.
+        mockHook.setPending(START, 40 ether);
+        assertEq(rewards.claimable(alice, START), 30 ether, "the view counts unharvested fees");
+        assertEq(rewards.claimable(bob, START), 35 ether);
+        assertEq(claimAs(bob, one(START)), 35 ether, "bob's claim harvests and pays 25% of 140");
+        assertEq(mockHook.pendingFeesOf(START), 0);
+        assertEq(claimAs(alice, one(START)), 30 ether, "alice is topped up to 75% of 140");
+        (uint128 total, uint128 claimed,,) = rewards.pots(START);
+        assertEq(total, 140 ether);
+        assertEq(claimed, 140 ether);
+        assertEq(rewards.reserved(), 0);
+        assertEq(imd.balanceOf(address(rewards)), 0);
+    }
+
+    function test_pendingFeesOfAClosedEpochGoToTheCurrentPot() public {
+        fund(100 ether);
+        vm.warp((START + rewards.CLAIM_WINDOW() + 1) * EPOCH);
+        rewards.recycle(START);
+        mockHook.setPending(START, 10 ether);
+        assertEq(rewards.claimable(alice, START), 0);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(DeezRewards.EpochClosed.selector, START));
+        rewards.claim(alice, one(START));
+        assertEq(mockHook.pendingFeesOf(START), 10 ether, "the reverted claim harvested nothing");
+        mockHook.harvestEpochs(one(START));
+        (uint128 current,,,) = rewards.pots(rewards.currentEpoch());
+        assertEq(current, 110 ether, "recycled 100 plus the late 10, owned by the current epoch's holders");
+        (uint128 closedTotal,,, bool closed) = rewards.pots(START);
+        assertTrue(closed);
+        assertEq(closedTotal, 100 ether, "the closed pot takes nothing");
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function testFuzz_claimOrderAndLateFeesDoNotChangeFinalShares(
+        uint96 a,
+        uint128 early,
+        uint128 late,
+        uint8 order,
+        uint32 moveAt
+    ) public {
+        address c = address(0xCA201);
+        vm.warp(START * EPOCH + bound(moveAt, 0, EPOCH - 1));
+        vm.prank(alice);
+        token.transfer(c, bound(a, 0, 75_000_000 ether));
+        uint256 p1 = bound(early, 0, 1e30);
+        uint256 p2 = bound(late, 0, 1e30);
+        if (p1 > 0) fund(p1);
+        nextEpoch();
+        address[3] memory holders = [alice, bob, c];
+        // A random subset claims before the late fees are known.
+        for (uint256 i = 0; i < 3; i++) {
+            if ((order >> i) & 1 == 1 && rewards.claimable(holders[i], START) > 0) claimAs(holders[i], one(START));
+        }
+        mockHook.setPending(START, p2);
+        for (uint256 i = 0; i < 3; i++) {
+            if (rewards.claimable(holders[i], START) > 0) claimAs(holders[i], one(START));
+        }
+        uint256 supply = rewards.eligibleSupplyAt(START);
+        uint256 paid;
+        for (uint256 i = 0; i < 3; i++) {
+            uint256 expected = (p1 + p2) * rewards.weightOf(holders[i], START) / supply;
+            assertEq(rewards.paidOf(START, holders[i]), expected, "final share is the full-pot share");
+            assertEq(imd.balanceOf(holders[i]), expected);
+            paid += expected;
+        }
+        assertLe(paid, p1 + p2);
+        (uint128 total, uint128 claimed,,) = rewards.pots(START);
+        assertEq(total, p1 + p2);
+        assertEq(claimed, paid);
+        assertEq(imd.balanceOf(address(rewards)), p1 + p2 - paid);
     }
 
     function test_batchWithAnUnendedEpochPaysNothing() public {
@@ -381,6 +460,45 @@ abstract contract DeezHookFailurePaths is DeezBase {
         assertEq(imd.balanceOf(address(rewards)), fee);
         assertEq(rewards.reserved(), fee);
         assertEq(hookClaims(), 0);
+    }
+
+    function test_claimThatRevertsLeavesTheHooksFeesUntouched() public {
+        vm.warp(2_000 * 1 days);
+        seedBalanced(1_000_000 ether);
+        address holder = address(0xA11CE);
+        token.transfer(holder, 100_000_000 ether);
+        token.transfer(address(manager), token.balanceOf(address(this)));
+        uint256 ended = rewards.currentEpoch();
+        buy(-5_000 ether);
+        vm.warp((ended + 1) * 1 days);
+        buy(-5_000 ether);
+        uint256 current = rewards.currentEpoch();
+        uint256 pendingEnded = hook.pendingFeesOf(ended);
+        uint256 pendingCurrent = hook.pendingFeesOf(current);
+        uint256 claims = hookClaims();
+        assertGt(pendingEnded, 0);
+        assertGt(pendingCurrent, 0);
+        uint256[] memory list = new uint256[](2);
+        list[0] = ended;
+        list[1] = current; // still running: the whole claim must revert, harvest included
+        vm.prank(holder);
+        vm.expectRevert(abi.encodeWithSelector(DeezRewards.EpochNotEnded.selector, current));
+        rewards.claim(holder, list);
+        assertEq(hook.pendingFeesOf(ended), pendingEnded);
+        assertEq(hook.pendingFeesOf(current), pendingCurrent);
+        assertEq(hookClaims(), claims, "no claim was burned");
+        assertEq(imd.balanceOf(address(rewards)), 0);
+        // The ended epoch alone pays the holder its weighted share of the day's fees, harvested by the claim
+        // (the buyer of the first swap held $DEEZ all day too and shares the pot).
+        uint256[] memory endedOnly = new uint256[](1);
+        endedOnly[0] = ended;
+        uint256 share = pendingEnded * rewards.weightOf(holder, ended) / rewards.eligibleSupplyAt(ended);
+        assertGt(share, pendingEnded / 2);
+        vm.prank(holder);
+        assertEq(rewards.claim(holder, endedOnly), share);
+        assertEq(hook.pendingFeesOf(ended), 0);
+        assertEq(hook.pendingFeesOf(current), pendingCurrent, "the running epoch's fees stay with the hook");
+        assertEq(hookClaims(), claims - pendingEnded);
     }
 
     function test_lockSpendsAlmostEverythingAndKeepsItLocked() public {
