@@ -7,8 +7,8 @@ import {DeezRewards} from "../src/DeezRewards.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
 /// @notice Drives the distributor in random order: holders move $DEEZ (also into and out of the excluded pool),
-/// $IMD arrives with and without `accrue`, time passes (sometimes past the claim window), anyone claims for
-/// anyone, epochs are finalized and recycled. Ghosts record what went in and what came out.
+/// $IMD arrives with and without `accrue`, time passes (sometimes past the claim window), holders claim, third
+/// parties try to claim for them, epochs are finalized and recycled. Ghosts record what went in and what came out.
 contract RewardsHandler is Test {
     uint256 internal constant EPOCH = 1 days;
 
@@ -31,6 +31,8 @@ contract RewardsHandler is Test {
     bool public overpaid;
     /// @dev Set when a claim or recycle reopened an epoch that was already closed.
     bool public reopened;
+    /// @dev Set when someone other than the account managed to claim its share.
+    bool public claimedByOther;
 
     constructor(
         DeezToken token_,
@@ -101,7 +103,7 @@ contract RewardsHandler is Test {
         vm.warp(block.timestamp + (rewards.CLAIM_WINDOW() + 1) * EPOCH + extra);
     }
 
-    function claim(uint256 actorSeed, uint256 epochSeed, address caller) external {
+    function claim(uint256 actorSeed, uint256 epochSeed) external {
         address account = _holder(actorSeed, true);
         uint256 epoch = _epoch(epochSeed);
         uint256[] memory list = new uint256[](1);
@@ -109,10 +111,10 @@ contract RewardsHandler is Test {
 
         (uint128 totalBefore, uint128 claimedBefore,, bool closedBefore) = rewards.pots(epoch);
         bool ended = rewards.hasEnded(epoch);
-        uint256 snapshotBalance = ended ? token.getPastBalanceOf(account, rewards.snapshotOf(epoch)) : 0;
+        uint256 weight = ended ? rewards.weightOf(account, epoch) : 0;
         uint256 before = imd.balanceOf(account);
 
-        vm.prank(caller);
+        vm.prank(account);
         try rewards.claim(account, list) returns (uint256 paid) {
             if (closedBefore) reopened = true;
             // `claim` accrues first, which credits the current epoch with any un-accrued $IMD.
@@ -122,10 +124,23 @@ contract RewardsHandler is Test {
             assertEq(totalAfter, totalBefore, "an ended pot never grows");
             assertEq(claimedAfter - claimedBefore, paid, "pot claimed tracks the payout");
             assertEq(imd.balanceOf(account) - before, paid, "payout reaches the account");
-            if (supply == 0 || paid * supply > uint256(totalBefore) * snapshotBalance) overpaid = true;
+            // paid <= pot * averageBalance / eligibleSupply
+            if (supply == 0 || paid * supply > uint256(totalBefore) * weight) overpaid = true;
             ghostPaid += paid;
             ghostPaidTo[account] += paid;
             ghostClaims++;
+        } catch {}
+    }
+
+    /// @dev A third party tries to claim an account's share; it must never succeed.
+    function claimFor(uint256 actorSeed, uint256 epochSeed, address caller) external {
+        address account = _holder(actorSeed, true);
+        if (caller == account) return;
+        uint256[] memory list = new uint256[](1);
+        list[0] = _epoch(epochSeed);
+        vm.prank(caller);
+        try rewards.claim(account, list) {
+            claimedByOther = true;
         } catch {}
     }
 
@@ -215,6 +230,10 @@ contract DeezRewardsInvariantTest is Test {
 
     function invariant_claimsNeverExceedTheBalanceShare() public view {
         assertFalse(handler.overpaid());
+    }
+
+    function invariant_onlyTheAccountClaimsItsShare() public view {
+        assertFalse(handler.claimedByOther());
     }
 
     function invariant_closedEpochsNeverReopen() public view {
