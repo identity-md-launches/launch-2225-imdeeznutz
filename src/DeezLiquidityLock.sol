@@ -27,11 +27,20 @@ interface IDeezHookForLock {
 /// function and no way to collect the position's LP fees: they compound into the pool for every trader.
 ///
 /// This is how the requester's 1% of supply (10,000,000 $DEEZ) is made permanent liquidity: transfer it here and
-/// call `lock()`. Both tokens present: a full-range position. $DEEZ only: a position in the range just above the
-/// current price (a permanent sell-side depth). $IMD only: a position just below the price (a permanent buy wall).
+/// call `lockAs(Token0Only or Token1Only, minTick, maxTick)` (whichever side $DEEZ sorts on) in the same bundle.
+/// Both tokens: a full-range position. $DEEZ only: a position in the range just above the current price (a
+/// permanent sell-side depth). $IMD only: a position just below the price (a permanent buy wall).
 contract DeezLiquidityLock is IUnlockCallback {
     using SafeERC20 for IERC20;
     using StateLibrary for IPoolManager;
+
+    /// @notice How `lockAs` shapes the position.
+    enum Mode {
+        Auto,
+        Token0Only,
+        Token1Only,
+        FullRange
+    }
 
     IPoolManager public immutable poolManager;
     IDeezHookForLock public immutable hook;
@@ -48,6 +57,7 @@ contract DeezLiquidityLock is IUnlockCallback {
     error PoolNotInitialized();
     error NothingToLock();
     error ZeroAddress();
+    error TickOutOfBounds(int24 tick, int24 minTick, int24 maxTick);
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -60,24 +70,44 @@ contract DeezLiquidityLock is IUnlockCallback {
         hook = IDeezHookForLock(hook_);
     }
 
-    /// @notice Turn every token this contract holds into locked liquidity in the launch pool.
+    /// @notice Turn every token this contract holds into locked liquidity in the launch pool, choosing the
+    /// position from the balances: both tokens present, a full-range position; one token only, a single-sided
+    /// position next to the current price. No tick bound.
+    /// @dev Convenience form of `lockAs`. Because it decides from balances anyone can top up, a caller who wants
+    /// a specific position (the requester locking 10,000,000 $DEEZ, for instance) should use `lockAs` with the
+    /// mode spelled out and a tick bound, so that 1 wei of the other token or a price move in the same block
+    /// cannot change what gets locked.
     /// @return liquidity The liquidity added.
     function lock() external returns (uint128 liquidity) {
+        return lockAs(Mode.Auto, TickMath.MIN_TICK, TickMath.MAX_TICK);
+    }
+
+    /// @notice Lock the balance this contract holds as a position of the given shape. Anyone may call it.
+    /// @param mode `Token0Only` / `Token1Only` lock only that token's balance, just above / at or below the
+    /// current price, and leave the other balance for a later call; `FullRange` locks both in a full-range
+    /// position (as much as the scarcer side funds); `Auto` picks one of these from the balances.
+    /// @param minTick Lowest current pool tick the caller accepts; reverts with `TickOutOfBounds` below it.
+    /// @param maxTick Highest current pool tick the caller accepts; reverts with `TickOutOfBounds` above it.
+    /// @return liquidity The liquidity added.
+    function lockAs(Mode mode, int24 minTick, int24 maxTick) public returns (uint128 liquidity) {
         if (!hook.initialized()) revert PoolNotInitialized();
         PoolKey memory key = hook.poolKey();
         uint256 balance0 = IERC20(Currency.unwrap(key.currency0)).balanceOf(address(this));
         uint256 balance1 = IERC20(Currency.unwrap(key.currency1)).balanceOf(address(this));
+        if (mode == Mode.Token0Only) balance1 = 0;
+        if (mode == Mode.Token1Only) balance0 = 0;
         if (balance0 == 0 && balance1 == 0) revert NothingToLock();
 
         (uint160 sqrtPriceX96, int24 tick,,) = poolManager.getSlot0(key.toId());
+        if (tick < minTick || tick > maxTick) revert TickOutOfBounds(tick, minTick, maxTick);
         int24 spacing = key.tickSpacing;
         int24 tickLower = TickMath.minUsableTick(spacing);
         int24 tickUpper = TickMath.maxUsableTick(spacing);
-        if (balance1 == 0) {
+        if (mode != Mode.FullRange && balance1 == 0) {
             // Token0 only: the whole position must sit above the current price.
             tickLower = _ceilToSpacing(tick + 1, spacing);
             if (tickLower >= tickUpper) tickLower = tickUpper - spacing;
-        } else if (balance0 == 0) {
+        } else if (mode != Mode.FullRange && balance0 == 0) {
             // Token1 only: the whole position must sit at or below the current price.
             tickUpper = _floorToSpacing(tick, spacing);
             if (tickUpper <= tickLower) tickUpper = tickLower + spacing;

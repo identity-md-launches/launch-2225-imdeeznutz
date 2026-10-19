@@ -28,6 +28,15 @@ contract Swapper is IUnlockCallback {
         return abi.decode(out, (BalanceDelta));
     }
 
+    /// @notice Swap with a caller-chosen price limit, as routers do for slippage protection.
+    function swapWithLimit(PoolKey memory key, bool zeroForOne, int256 amountSpecified, uint160 limit)
+        external
+        returns (BalanceDelta)
+    {
+        bytes memory out = manager.unlock(abi.encode(SWAP, key, SwapParams(zeroForOne, amountSpecified, limit)));
+        return abi.decode(out, (BalanceDelta));
+    }
+
     function addLiquidity(PoolKey memory key, int24 tickLower, int24 tickUpper, int256 liquidity)
         external
         returns (BalanceDelta)

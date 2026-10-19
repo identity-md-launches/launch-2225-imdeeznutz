@@ -7,25 +7,29 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 /// @notice The slice of the launch token the distributor reads.
 interface IDeezToken is IERC20 {
-    function getPastBalanceOf(address account, uint256 timepoint) external view returns (uint256);
+    function getCumulativeBalanceOf(address account, uint256 timepoint) external view returns (uint256);
+    function getCumulativeTotalSupply(uint256 timepoint) external view returns (uint256);
 }
 
 /// @title DEEZ holder rewards
 /// @notice Pays every $DEEZ holder its share of the trading fees the hook collects, in $IMD, weighted strictly
-/// by the balance it held at the end of each daily epoch. No owner, no admin, no top-N cutoff.
+/// by the average balance it held over each daily epoch. No owner, no admin, no top-N cutoff.
 ///
 /// How the math works, per epoch `e` (a UTC day, `[e * EPOCH_LENGTH, (e + 1) * EPOCH_LENGTH)`):
-///   - Every $IMD that reaches this contract while epoch `e` is current, through the hook's `harvest()` or a
-///     plain transfer, is credited to `pots[e].total` the next time anyone calls `accrue()`.
-///   - `snapshotOf(e)` is the last second of the epoch. Balances at that second are final once the next epoch
-///     has begun, and come from the token's own checkpoint history.
-///   - `eligibleSupply(e)` = total supply minus the balances of the four excluded addresses at the snapshot:
-///     the PoolManager (the pool's liquidity), the burn address, the hook and this contract.
-///   - `claimable(account, e)` = `pots[e].total * balanceAt(account, snapshot) / eligibleSupply(e)`.
-///   - Anyone may call `claim` for any account; the payout always goes to that account.
+///   - The hook records every fee against the epoch the trade happened in and, when anyone harvests, credits
+///     it to `pots[e].total` through `credit`. $IMD sent here any other way is credited to the current epoch by
+///     `accrue()`.
+///   - `weightOf(account, e)` is the account's average $DEEZ balance over the epoch, from the token's own
+///     balance history: a wallet that held 100 $DEEZ all day weighs 100; one that held 100 for the last block
+///     weighs 100 / 7200.
+///   - `eligibleSupplyAt(e)` = the average total supply over the epoch minus the average balances of the four
+///     excluded addresses: the PoolManager (the pool's liquidity), the burn address, the hook and this contract.
+///   - `claimable(account, e)` = `pots[e].total * weightOf(account, e) / eligibleSupplyAt(e)`.
+///   - Only the account itself may claim; the payout goes to the account. Nobody can push a share into a
+///     contract that cannot spend it.
 ///   - A share not claimed within `CLAIM_WINDOW` epochs is recycled into the current epoch's pot, so nothing is
-///     stranded by holders who never claim (the burn-adjacent dust, abandoned wallets, the swarm's Merkle
-///     distributor while its allocation sits unclaimed).
+///     stranded by holders who never claim (abandoned wallets, contracts holding $DEEZ without a claim path,
+///     such as the swarm's Merkle distributor while its allocation sits unclaimed).
 contract DeezRewards is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -34,16 +38,17 @@ contract DeezRewards is ReentrancyGuard {
         uint128 total;
         /// @dev $IMD already paid out of it.
         uint128 claimed;
-        /// @dev Total supply minus excluded balances at the snapshot; 0 until finalized.
+        /// @dev Average eligible supply over the epoch; 0 until finalized.
         uint256 eligibleSupply;
         /// @dev Whether the unclaimed remainder was recycled; no claims after that.
         bool closed;
     }
 
-    /// @notice Length of one reward epoch.
+    /// @notice Length of one reward epoch. Equals the token's `CUMULATIVE_UNIT`, so an epoch weight is an
+    /// average balance in wei.
     uint256 public constant EPOCH_LENGTH = 1 days;
     /// @notice Epochs a share stays claimable before `recycle` may fold it into the current pot.
-    uint256 public constant CLAIM_WINDOW = 365;
+    uint256 public constant CLAIM_WINDOW = 90;
     /// @notice The conventional burn address, excluded from rewards.
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
@@ -53,7 +58,7 @@ contract DeezRewards is ReentrancyGuard {
     IERC20 public immutable rewardToken;
     /// @notice The Uniswap v4 PoolManager: it holds the pool's $DEEZ, so it is excluded.
     address public immutable poolManager;
-    /// @notice The fee hook that feeds this contract; excluded as well.
+    /// @notice The fee hook that feeds this contract; excluded as well, and the only caller of `credit`.
     address public immutable hook;
 
     /// @notice Reward token already assigned to pots (claimed or not); anything above it is new.
@@ -69,6 +74,9 @@ contract DeezRewards is ReentrancyGuard {
     event Recycled(uint256 indexed epoch, uint256 indexed intoEpoch, uint256 amount);
 
     error ZeroAddress();
+    error NotHook();
+    error NotAccount(address account);
+    error Unfunded(uint256 amount, uint256 available);
     error EpochNotEnded(uint256 epoch);
     error EpochClosed(uint256 epoch);
     error AlreadyClaimed(uint256 epoch, address account);
@@ -93,12 +101,12 @@ contract DeezRewards is ReentrancyGuard {
         return block.timestamp / EPOCH_LENGTH;
     }
 
-    /// @notice The last second of epoch `epoch`: balances at this timepoint decide its shares.
+    /// @notice The last second of epoch `epoch`; its weights are final once this second has passed.
     function snapshotOf(uint256 epoch) public pure returns (uint256) {
         return (epoch + 1) * EPOCH_LENGTH - 1;
     }
 
-    /// @notice Whether epoch `epoch` has ended, i.e. its snapshot balances are final.
+    /// @notice Whether epoch `epoch` has ended, i.e. its average balances are final.
     function hasEnded(uint256 epoch) public view returns (bool) {
         return block.timestamp > snapshotOf(epoch);
     }
@@ -109,13 +117,20 @@ contract DeezRewards is ReentrancyGuard {
             || account == address(0);
     }
 
-    /// @notice Total supply minus the excluded balances at the end of `epoch` (reverts until the epoch ended).
+    /// @notice The average $DEEZ balance `account` held over `epoch`, in wei (reverts until the epoch ended).
+    function weightOf(address account, uint256 epoch) public view returns (uint256) {
+        uint256 start = epoch * EPOCH_LENGTH;
+        return
+            token.getCumulativeBalanceOf(account, start + EPOCH_LENGTH) - token.getCumulativeBalanceOf(account, start);
+    }
+
+    /// @notice Average total supply minus the excluded averages over `epoch` (reverts until the epoch ended).
     function eligibleSupplyAt(uint256 epoch) public view returns (uint256) {
-        uint256 snapshot = snapshotOf(epoch);
-        uint256 excluded = token.getPastBalanceOf(poolManager, snapshot)
-            + token.getPastBalanceOf(BURN_ADDRESS, snapshot) + token.getPastBalanceOf(hook, snapshot)
-            + token.getPastBalanceOf(address(this), snapshot);
-        return token.totalSupply() - excluded;
+        uint256 start = epoch * EPOCH_LENGTH;
+        uint256 total = token.getCumulativeTotalSupply(start + EPOCH_LENGTH) - token.getCumulativeTotalSupply(start);
+        uint256 excluded = weightOf(poolManager, epoch) + weightOf(BURN_ADDRESS, epoch) + weightOf(hook, epoch)
+            + weightOf(address(this), epoch);
+        return total > excluded ? total - excluded : 0;
     }
 
     /// @notice What `account` can still claim for `epoch`; zero if not ended, already claimed, closed or excluded.
@@ -125,7 +140,7 @@ contract DeezRewards is ReentrancyGuard {
         if (pot.closed || pot.total == 0) return 0;
         uint256 supply = pot.eligibleSupply == 0 ? eligibleSupplyAt(epoch) : pot.eligibleSupply;
         if (supply == 0) return 0;
-        return uint256(pot.total) * token.getPastBalanceOf(account, snapshotOf(epoch)) / supply;
+        return _share(pot, weightOf(account, epoch), supply);
     }
 
     /// @notice Sum of `claimable` over `epochs`.
@@ -138,7 +153,7 @@ contract DeezRewards is ReentrancyGuard {
     // ------------------------------------------------------------- mutations
 
     /// @notice Credit every reward token received since the last call to the current epoch's pot.
-    /// @dev Permissionless. The hook calls it after each `harvest()`; anyone may donate $IMD and call it.
+    /// @dev Permissionless: anyone may donate $IMD and call it. The hook's fees come in through `credit`.
     function accrue() public returns (uint256 amount) {
         uint256 balance = rewardToken.balanceOf(address(this));
         uint256 reserved_ = reserved;
@@ -147,6 +162,20 @@ contract DeezRewards is ReentrancyGuard {
         uint256 epoch = currentEpoch();
         pots[epoch].total += uint128(amount);
         reserved = balance;
+        emit Accrued(epoch, amount);
+    }
+
+    /// @notice Credit `amount` of reward token the hook has just transferred here to the pot of `epoch`, the
+    /// epoch the fees were traded in. Only the hook may call this, and only for $IMD it actually delivered.
+    /// @dev An epoch already recycled (closed) cannot take new money that nobody could claim: it goes to the
+    /// current epoch instead.
+    function credit(uint256 epoch, uint256 amount) external {
+        if (msg.sender != hook) revert NotHook();
+        uint256 available = rewardToken.balanceOf(address(this)) - reserved;
+        if (amount > available) revert Unfunded(amount, available);
+        if (pots[epoch].closed || epoch > currentEpoch()) epoch = currentEpoch();
+        pots[epoch].total += uint128(amount);
+        reserved += amount;
         emit Accrued(epoch, amount);
     }
 
@@ -160,10 +189,12 @@ contract DeezRewards is ReentrancyGuard {
         emit Finalized(epoch, supply);
     }
 
-    /// @notice Pay `account` its share of each epoch in `epochs`. Anyone may call this for anyone.
-    /// @dev Accrues first so a harvest and a claim in the same block never miss each other. Reverts when the
+    /// @notice Pay `account` its share of each epoch in `epochs`. Only `account` itself may call this, so no
+    /// third party can direct a share into a contract that cannot move it.
+    /// @dev Accrues first so a donation and a claim in the same block never miss each other. Reverts when the
     /// whole batch pays nothing, so a stale or duplicate claim is visible instead of silently succeeding.
     function claim(address account, uint256[] calldata epochs) external nonReentrant returns (uint256 total) {
+        if (msg.sender != account) revert NotAccount(account);
         if (isExcluded(account)) revert Excluded(account);
         accrue();
         for (uint256 i = 0; i < epochs.length; i++) {
@@ -174,7 +205,7 @@ contract DeezRewards is ReentrancyGuard {
             uint256 supply = finalize(epoch);
             claimed[epoch][account] = true;
             if (pot.total == 0 || supply == 0) continue;
-            uint256 amount = uint256(pot.total) * token.getPastBalanceOf(account, snapshotOf(epoch)) / supply;
+            uint256 amount = _share(pot, weightOf(account, epoch), supply);
             if (amount == 0) continue;
             pot.claimed += uint128(amount);
             total += amount;
@@ -196,5 +227,13 @@ contract DeezRewards is ReentrancyGuard {
         uint256 into = currentEpoch();
         pots[into].total += uint128(amount);
         emit Recycled(epoch, into, amount);
+    }
+
+    /// @dev `pot.total * weight / supply`, never more than what is left in the pot (the per-checkpoint rounding
+    /// of the token's cumulative balances can put the sum of weights a few wei over the eligible supply).
+    function _share(Pot storage pot, uint256 weight, uint256 supply) private view returns (uint256 amount) {
+        amount = uint256(pot.total) * weight / supply;
+        uint256 left = pot.total - pot.claimed;
+        if (amount > left) amount = left;
     }
 }

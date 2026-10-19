@@ -26,10 +26,14 @@ import {DeezLiquidityLock} from "./DeezLiquidityLock.sol";
 ///   - Sell, exact input ($DEEZ specified):  2% of the $IMD the pool pays out is diverted after the swap.
 ///   - Sell, exact output ($IMD specified):  the pool pays out 2/98 more than asked and the hook keeps that,
 ///     so the fee is 2% of everything the pool paid out and the trader receives exactly what it asked for.
+/// On the two $IMD-specified cases the fee is taken from the requested amount before the swap, so a swap the
+/// pool cannot fill in full (price limit reached, or no $IMD left to pay out) reverts with `PartialFill`
+/// rather than charging more than 2% of what actually traded.
 /// Each fee is minted to the hook as an ERC-6909 claim on the PoolManager inside the swap, so it needs no
 /// balance in the PoolManager (a launch pool is seeded with $DEEZ only) and can never make a swap revert
-/// because a recipient refused it. Anyone may call `harvest()` to burn the claims, move the $IMD into
-/// `DeezRewards` and credit the current reward epoch.
+/// because a recipient refused it. Fees are recorded against the reward epoch they were traded in; anyone may
+/// call `harvest()` to burn the claims, move the $IMD into `DeezRewards` and credit each epoch's own pot, so
+/// nobody can choose which day's holders a fee goes to by timing the harvest.
 ///
 /// No owner, no settable parameter, no pause: the hook has no admin surface. It has no liquidity callbacks,
 /// so the launch factory's fee collect (a zero liquidity change) is never touched.
@@ -61,10 +65,12 @@ contract DeezHook is IHooks, IUnlockCallback {
     PoolKey private _poolKey;
     /// @notice $IMD taken as fees and not yet harvested (held as an ERC-6909 claim on the PoolManager).
     uint256 public pendingFees;
+    /// @notice The part of `pendingFees` traded in each reward epoch; harvesting credits it to that epoch's pot.
+    mapping(uint256 epoch => uint256 amount) public pendingFeesOf;
     /// @notice $IMD moved into `rewards` over the hook's lifetime.
     uint256 public totalHarvested;
 
-    event FeeTaken(bool indexed buy, uint256 amount);
+    event FeeTaken(bool indexed buy, uint256 indexed epoch, uint256 amount);
     event Harvested(uint256 amount);
 
     error NotPoolManager();
@@ -73,6 +79,8 @@ contract DeezHook is IHooks, IUnlockCallback {
     error WrongPool();
     error ZeroAddress();
     error SameCurrency();
+    /// @notice The pool filled less than the swap asked for, so the fee taken up front would exceed 2%.
+    error PartialFill(int256 expectedPairedDelta, int256 actualPairedDelta);
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -157,7 +165,11 @@ contract DeezHook is IHooks, IUnlockCallback {
 
     /// @inheritdoc IHooks
     /// @dev When the unspecified currency is $IMD (exact-output buy, exact-input sell) the fee is known only now.
-    /// The total fee of the swap (both halves) is minted to the hook as an ERC-6909 claim here.
+    /// When $IMD was the specified currency, the fee `beforeSwap` already took assumed the pool would fill the
+    /// whole request; a partial fill (the trader's price limit reached, or the pool out of $IMD on an exact-output
+    /// sell) would make that fee more than 2% of what actually traded, so such a swap reverts instead.
+    /// The total fee of the swap (both halves) is minted to the hook as an ERC-6909 claim here and recorded
+    /// against the reward epoch the trade happens in.
     function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         external
         onlyPoolManager
@@ -165,34 +177,69 @@ contract DeezHook is IHooks, IUnlockCallback {
     {
         _checkPool(key);
         uint256 specifiedFee = _specifiedFee(params);
+        if (specifiedFee > 0) _requireFullFill(params, delta, specifiedFee);
         uint256 unspecifiedFee = _unspecifiedFee(params, delta);
         uint256 total = specifiedFee + unspecifiedFee;
         if (total > 0) {
             poolManager.mint(address(this), pairedCurrency.toId(), total);
+            uint256 epoch = rewards.currentEpoch();
             pendingFees += total;
-            emit FeeTaken(_isBuy(params), total);
+            pendingFeesOf[epoch] += total;
+            emit FeeTaken(_isBuy(params), epoch, total);
         }
         return (IHooks.afterSwap.selector, unspecifiedFee.toInt128());
     }
 
-    /// @notice Burn the hook's $IMD claims, move the $IMD into `DeezRewards` and credit the current epoch.
+    /// @notice Harvest the fees of the current and the previous reward epoch: burn the hook's $IMD claims, move
+    /// the $IMD into `DeezRewards` and credit each epoch's pot with the fees traded in that epoch.
     /// @dev Permissionless. If the pair token ever refuses the transfer, swaps keep working and the claims wait.
+    /// Fees of older epochs (`pendingFeesOf`) are harvested with `harvestEpochs`.
     function harvest() external returns (uint256 amount) {
-        amount = pendingFees;
+        uint256 epoch = rewards.currentEpoch();
+        uint256[] memory epochs = new uint256[](epoch == 0 ? 1 : 2);
+        epochs[0] = epoch;
+        if (epoch != 0) epochs[1] = epoch - 1;
+        return _harvest(epochs);
+    }
+
+    /// @notice Harvest the fees traded in `epochs`, each credited to its own pot. Anyone may call this.
+    function harvestEpochs(uint256[] calldata epochs) external returns (uint256 amount) {
+        return _harvest(epochs);
+    }
+
+    function _harvest(uint256[] memory epochs) internal returns (uint256 amount) {
+        uint256[] memory amounts = new uint256[](epochs.length);
+        for (uint256 i = 0; i < epochs.length; i++) {
+            amounts[i] = pendingFeesOf[epochs[i]];
+            pendingFeesOf[epochs[i]] = 0;
+            amount += amounts[i];
+        }
         if (amount == 0) return 0;
-        poolManager.unlock("");
-        rewards.accrue();
+        pendingFees -= amount;
+        totalHarvested += amount;
+        rewards.accrue(); // stray donations go to the current epoch before the fees are credited to theirs
+        poolManager.unlock(abi.encode(amount));
+        for (uint256 i = 0; i < epochs.length; i++) {
+            if (amounts[i] > 0) rewards.credit(epochs[i], amounts[i]);
+        }
+        emit Harvested(amount);
     }
 
     /// @inheritdoc IUnlockCallback
-    function unlockCallback(bytes calldata) external onlyPoolManager returns (bytes memory) {
-        uint256 amount = pendingFees;
-        pendingFees = 0;
-        totalHarvested += amount;
+    function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
+        uint256 amount = abi.decode(data, (uint256));
         poolManager.burn(address(this), pairedCurrency.toId(), amount);
         poolManager.take(pairedCurrency, address(rewards), amount);
-        emit Harvested(amount);
         return "";
+    }
+
+    /// @dev The fee on an $IMD-specified swap was computed in `beforeSwap` from the requested amount, so the pool
+    /// must have traded exactly the rest: `in - fee` on an exact-input buy, `out + fee` on an exact-output sell.
+    function _requireFullFill(SwapParams calldata params, BalanceDelta delta, uint256 fee) internal view {
+        int128 paired = tokenIsCurrency0 ? delta.amount1() : delta.amount0();
+        // Exact input (negative): the pool received `in - fee`. Exact output (positive): it paid `out + fee`.
+        int256 expected = params.amountSpecified + int256(fee);
+        if (int256(paired) != expected) revert PartialFill(expected, paired);
     }
 
     // ------------------------------------------------------------ fee math

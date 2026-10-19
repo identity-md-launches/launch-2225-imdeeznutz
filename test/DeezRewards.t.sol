@@ -6,6 +6,9 @@ import {DeezToken} from "../src/DeezToken.sol";
 import {DeezRewards} from "../src/DeezRewards.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
+/// @dev Stands in for the swarm's Merkle distributor or any other contract that holds $DEEZ and cannot claim.
+contract HoldingContract {}
+
 /// @notice Unit tests of the distributor alone, with stand-in pool manager and hook addresses.
 contract DeezRewardsTest is Test {
     uint256 constant EPOCH = 1 days;
@@ -23,7 +26,7 @@ contract DeezRewardsTest is Test {
     address dead = 0x000000000000000000000000000000000000dEaD;
 
     function setUp() public {
-        vm.warp(100 * EPOCH + 5); // epoch 100
+        vm.warp(100 * EPOCH); // the first second of epoch 100: everything below holds for the whole epoch
         token = new DeezToken();
         imd = new MockERC20("IMD", "IMD", 0);
         rewards = new DeezRewards(address(token), address(imd), poolManager, hook);
@@ -34,9 +37,21 @@ contract DeezRewardsTest is Test {
         rewards.accrue();
     }
 
+    /// @dev Transfer `amount` of $IMD in and credit it to `epoch` the way the hook does after a harvest.
+    function creditAsHook(uint256 epoch, uint256 amount) internal {
+        imd.mint(address(rewards), amount);
+        vm.prank(hook);
+        rewards.credit(epoch, amount);
+    }
+
     function epochs(uint256 e) internal pure returns (uint256[] memory list) {
         list = new uint256[](1);
         list[0] = e;
+    }
+
+    function claimAs(address account, uint256 e) internal returns (uint256) {
+        vm.prank(account);
+        return rewards.claim(account, epochs(e));
     }
 
     function eligible() internal view returns (uint256) {
@@ -57,7 +72,8 @@ contract DeezRewardsTest is Test {
         assertFalse(rewards.hasEnded(100));
         assertTrue(rewards.hasEnded(99));
         assertEq(rewards.EPOCH_LENGTH(), 1 days);
-        assertEq(rewards.CLAIM_WINDOW(), 365);
+        assertEq(rewards.EPOCH_LENGTH(), token.CUMULATIVE_UNIT(), "an epoch weight is an average balance");
+        assertEq(rewards.CLAIM_WINDOW(), 90);
     }
 
     function test_excludedAddresses() public view {
@@ -78,7 +94,7 @@ contract DeezRewardsTest is Test {
         assertEq(rewards.reserved(), 1_000 ether);
     }
 
-    function test_claimsAreProportionalToBalanceAtTheSnapshot() public {
+    function test_claimsAreProportionalToTheAverageBalance() public {
         token.transfer(alice, 300 ether);
         token.transfer(bob, 100 ether);
         token.transfer(poolManager, 500_000_000 ether); // the pool's share earns nothing
@@ -89,7 +105,8 @@ contract DeezRewardsTest is Test {
 
         vm.warp(101 * EPOCH); // epoch 100 just ended
         assertTrue(rewards.hasEnded(100));
-        assertEq(rewards.eligibleSupplyAt(100), supply);
+        assertEq(rewards.eligibleSupplyAt(100), supply, "held all epoch: the average is the balance");
+        assertEq(rewards.weightOf(alice, 100), 300 ether);
 
         uint256 expectedAlice = 1_000 ether * 300 ether / supply;
         uint256 expectedBob = 1_000 ether * 100 ether / supply;
@@ -97,15 +114,62 @@ contract DeezRewardsTest is Test {
         assertEq(rewards.claimable(bob, 100), expectedBob);
         assertEq(rewards.claimable(poolManager, 100), 0);
 
-        vm.prank(carol); // anyone may trigger a claim; the money goes to the holder
-        assertEq(rewards.claim(alice, epochs(100)), expectedAlice);
+        assertEq(claimAs(alice, 100), expectedAlice);
         assertEq(imd.balanceOf(alice), expectedAlice);
-        assertEq(imd.balanceOf(carol), 0);
-        assertEq(rewards.claim(bob, epochs(100)), expectedBob);
+        assertEq(claimAs(bob, 100), expectedBob);
         assertEq(expectedAlice, 3 * expectedBob, "three times the bag, three times the share");
         (,, uint256 storedSupply,) = rewards.pots(100);
         assertEq(storedSupply, supply, "finalized on first claim");
         assertEq(rewards.reserved(), 1_000 ether - expectedAlice - expectedBob);
+    }
+
+    function test_onlyTheAccountItselfCanClaim() public {
+        HoldingContract dist = new HoldingContract();
+        token.transfer(address(dist), 100_000_000 ether); // the swarm's 10%, in a contract that cannot claim
+        token.transfer(alice, 900_000_000 ether);
+        fund(1_000 ether);
+        vm.warp(102 * EPOCH);
+
+        vm.prank(address(0xBAD));
+        vm.expectRevert(abi.encodeWithSelector(DeezRewards.NotAccount.selector, address(dist)));
+        rewards.claim(address(dist), epochs(100));
+        vm.prank(carol);
+        vm.expectRevert(abi.encodeWithSelector(DeezRewards.NotAccount.selector, alice));
+        rewards.claim(alice, epochs(100));
+        assertEq(imd.balanceOf(address(dist)), 0, "nothing was pushed into the contract");
+
+        // The share stays claimable by the account alone, and anything never claimed is recycled to holders.
+        assertEq(rewards.claimable(address(dist), 100), 100 ether);
+        assertEq(claimAs(alice, 100), 900 ether);
+        vm.warp((100 + 90 + 1) * EPOCH);
+        assertEq(rewards.recycle(100), 100 ether, "the unclaimed 10% goes back to the holders");
+    }
+
+    function test_rewardsAreWeightedByHoldingTime() public {
+        // alice holds 100 all day; bob buys 100 one second before the day ends and sells right after it.
+        token.transfer(alice, 100 ether);
+        token.transfer(poolManager, SUPPLY - 200 ether);
+        fund(1_000 ether);
+        vm.warp(101 * EPOCH - 1);
+        token.transfer(bob, 100 ether);
+        vm.warp(101 * EPOCH);
+        vm.prank(bob);
+        token.transfer(address(this), 100 ether);
+
+        uint256 aliceWeight = 100 ether;
+        uint256 bobWeight = 100 ether * 1 / EPOCH; // one second of 86,400
+        assertEq(rewards.weightOf(alice, 100), aliceWeight);
+        assertEq(rewards.weightOf(bob, 100), bobWeight);
+        // The deployer held the other 100 for all but one second.
+        uint256 deployerWeight = 100 ether * (EPOCH - 1) / EPOCH;
+        assertEq(rewards.weightOf(address(this), 100), deployerWeight);
+        uint256 supply = rewards.eligibleSupplyAt(100);
+        assertEq(supply, 200 ether);
+
+        assertEq(claimAs(alice, 100), 1_000 ether * aliceWeight / supply);
+        assertEq(claimAs(bob, 100), 1_000 ether * bobWeight / supply);
+        assertLt(imd.balanceOf(bob), 0.01 ether, "a one-second holder earns one 86,400th of a day's weight");
+        assertApproxEqAbs(imd.balanceOf(alice), 500 ether, 1, "the all-day holder earns its full half");
     }
 
     function test_deployerShareIsProportionalToo() public {
@@ -114,11 +178,11 @@ contract DeezRewardsTest is Test {
         token.transfer(poolManager, 500_000_000 ether);
         fund(100 ether);
         vm.warp(101 * EPOCH);
-        assertEq(rewards.claim(alice, epochs(100)), 50 ether);
-        assertEq(rewards.claim(address(this), epochs(100)), 50 ether);
+        assertEq(claimAs(alice, 100), 50 ether);
+        assertEq(claimAs(address(this), 100), 50 ether);
     }
 
-    function test_balanceMovedAfterTheSnapshotDoesNotChangeTheEpoch() public {
+    function test_balanceMovedAfterTheEpochDoesNotChangeIt() public {
         token.transfer(alice, 100 ether);
         fund(100 ether);
         vm.warp(101 * EPOCH);
@@ -134,9 +198,48 @@ contract DeezRewardsTest is Test {
         assertEq(rewards.claimable(carol, 101), 100 ether * 100 ether / supply);
     }
 
+    function test_creditGoesToTheEpochTheHookNames() public {
+        token.transfer(alice, 100 ether);
+        vm.warp(103 * EPOCH);
+        creditAsHook(100, 60 ether);
+        creditAsHook(101, 40 ether);
+        (uint128 pot100,,,) = rewards.pots(100);
+        (uint128 pot101,,,) = rewards.pots(101);
+        (uint128 pot103,,,) = rewards.pots(103);
+        assertEq(pot100, 60 ether);
+        assertEq(pot101, 40 ether);
+        assertEq(pot103, 0);
+        assertEq(rewards.reserved(), 100 ether);
+        assertEq(rewards.accrue(), 0, "credited money is not accrued twice");
+    }
+
+    function test_creditRefusesOthersAndUnfundedAmounts() public {
+        imd.mint(address(rewards), 10 ether);
+        vm.expectRevert(DeezRewards.NotHook.selector);
+        rewards.credit(100, 10 ether);
+        vm.prank(hook);
+        vm.expectRevert(abi.encodeWithSelector(DeezRewards.Unfunded.selector, 11 ether, 10 ether));
+        rewards.credit(100, 11 ether);
+        vm.prank(hook);
+        rewards.credit(100, 10 ether);
+        (uint128 pot,,,) = rewards.pots(100);
+        assertEq(pot, 10 ether);
+    }
+
+    function test_creditToAClosedOrFutureEpochGoesToTheCurrentOne() public {
+        token.transfer(alice, 100 ether);
+        vm.warp((100 + 90 + 1) * EPOCH);
+        rewards.recycle(100); // closes the empty pot
+        creditAsHook(100, 5 ether);
+        creditAsHook(500, 5 ether);
+        (uint128 now_,,,) = rewards.pots(rewards.currentEpoch());
+        assertEq(now_, 10 ether);
+    }
+
     function test_claimBeforeTheEpochEndsReverts() public {
         token.transfer(alice, 100 ether);
         fund(100 ether);
+        vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(DeezRewards.EpochNotEnded.selector, 100));
         rewards.claim(alice, epochs(100));
         assertEq(rewards.claimable(alice, 100), 0);
@@ -146,12 +249,14 @@ contract DeezRewardsTest is Test {
         token.transfer(alice, 100 ether);
         fund(100 ether);
         vm.warp(101 * EPOCH);
-        rewards.claim(alice, epochs(100));
+        claimAs(alice, 100);
+        vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(DeezRewards.AlreadyClaimed.selector, 100, alice));
         rewards.claim(alice, epochs(100));
         uint256[] memory twice = new uint256[](2);
         twice[0] = 100;
         twice[1] = 100;
+        vm.prank(bob);
         vm.expectRevert(abi.encodeWithSelector(DeezRewards.AlreadyClaimed.selector, 100, bob));
         rewards.claim(bob, twice);
     }
@@ -159,10 +264,13 @@ contract DeezRewardsTest is Test {
     function test_excludedAddressesCannotClaim() public {
         fund(100 ether);
         vm.warp(101 * EPOCH);
+        vm.prank(poolManager);
         vm.expectRevert(abi.encodeWithSelector(DeezRewards.Excluded.selector, poolManager));
         rewards.claim(poolManager, epochs(100));
+        vm.prank(dead);
         vm.expectRevert(abi.encodeWithSelector(DeezRewards.Excluded.selector, dead));
         rewards.claim(dead, epochs(100));
+        vm.prank(hook);
         vm.expectRevert(abi.encodeWithSelector(DeezRewards.Excluded.selector, hook));
         rewards.claim(hook, epochs(100));
     }
@@ -170,8 +278,10 @@ contract DeezRewardsTest is Test {
     function test_emptyClaimReverts() public {
         fund(100 ether);
         vm.warp(101 * EPOCH);
+        vm.prank(alice);
         vm.expectRevert(DeezRewards.NothingToClaim.selector);
         rewards.claim(alice, epochs(100)); // alice holds nothing
+        vm.prank(alice);
         vm.expectRevert(DeezRewards.NothingToClaim.selector);
         rewards.claim(alice, epochs(99)); // no pot
     }
@@ -192,6 +302,7 @@ contract DeezRewardsTest is Test {
         list[2] = 102;
         uint256 expected = rewards.claimableMany(alice, list);
         assertApproxEqRel(expected, 600 ether, 1e12);
+        vm.prank(alice);
         assertEq(rewards.claim(alice, list), expected);
         assertEq(imd.balanceOf(alice), expected);
     }
@@ -201,11 +312,11 @@ contract DeezRewardsTest is Test {
         token.transfer(bob, 500_000_000 ether - 1 ether);
         fund(100 ether);
         vm.warp(101 * EPOCH);
-        rewards.claim(alice, epochs(100));
+        claimAs(alice, 100);
         vm.expectRevert(abi.encodeWithSelector(DeezRewards.ClaimWindowOpen.selector, 100));
         rewards.recycle(100);
 
-        vm.warp((100 + 365 + 1) * EPOCH);
+        vm.warp((100 + 90 + 1) * EPOCH);
         uint256 remainder = rewards.recycle(100);
         assertGt(remainder, 0);
         (uint128 total, uint128 claimedAmount,, bool closed) = rewards.pots(100);
@@ -214,13 +325,14 @@ contract DeezRewardsTest is Test {
         (uint128 nowTotal,,,) = rewards.pots(rewards.currentEpoch());
         assertEq(nowTotal, remainder, "credited to the current epoch");
         assertEq(rewards.claimable(bob, 100), 0);
+        vm.prank(bob);
         vm.expectRevert(abi.encodeWithSelector(DeezRewards.EpochClosed.selector, 100));
         rewards.claim(bob, epochs(100));
         vm.expectRevert(abi.encodeWithSelector(DeezRewards.EpochClosed.selector, 100));
         rewards.recycle(100);
         // Bob can still claim the recycled epoch like any other once it ends.
-        vm.warp((100 + 365 + 2) * EPOCH);
-        assertGt(rewards.claim(bob, epochs(100 + 365 + 1)), 0);
+        vm.warp((100 + 90 + 2) * EPOCH);
+        assertGt(claimAs(bob, 100 + 90 + 1), 0);
     }
 
     function test_finalizeRequiresAnEndedEpoch() public {
@@ -242,12 +354,33 @@ contract DeezRewardsTest is Test {
         vm.warp(101 * EPOCH);
         uint256 supply = uint256(a) + b;
         assertEq(rewards.eligibleSupplyAt(100), supply);
-        uint256 paidA = rewards.claim(alice, epochs(100));
-        uint256 paidB = rewards.claim(bob, epochs(100));
+        uint256 paidA = claimAs(alice, 100);
+        uint256 paidB = claimAs(bob, 100);
         assertEq(paidA, uint256(pot) * a / supply);
         assertEq(paidB, uint256(pot) * b / supply);
         assertLe(paidA + paidB, pot, "never pays more than the pot");
         assertGe(paidA + paidB + 2, pot, "at most rounding dust stays");
         assertEq(imd.balanceOf(address(rewards)), uint256(pot) - paidA - paidB);
+    }
+
+    function testFuzz_claimsNeverExceedThePotWithMidEpochMoves(uint96 a, uint32 t1, uint32 t2, uint96 pot) public {
+        // Balances move at arbitrary seconds inside the epoch; the sum of every claim never exceeds the pot.
+        a = uint96(bound(a, 1 ether, 1e26));
+        t1 = uint32(bound(t1, 1, EPOCH - 2));
+        t2 = uint32(bound(t2, t1 + 1, EPOCH - 1));
+        pot = uint96(bound(pot, 1 ether, 1e24));
+        token.transfer(poolManager, SUPPLY - 3 * uint256(a));
+        token.transfer(alice, a);
+        fund(pot);
+        vm.warp(100 * EPOCH + t1);
+        token.transfer(bob, a);
+        vm.warp(100 * EPOCH + t2);
+        vm.prank(alice);
+        token.transfer(carol, a / 2);
+        vm.warp(101 * EPOCH);
+        uint256 paid = claimAs(alice, 100) + claimAs(bob, 100) + claimAs(carol, 100) + claimAs(address(this), 100);
+        assertLe(paid, pot, "never pays more than the pot");
+        // Each weight is floored to a wei-day per checkpoint segment; at pot / supply <= 1e6 that is < 1e7 wei.
+        assertGe(paid + 1e7, pot, "at most rounding dust stays");
     }
 }

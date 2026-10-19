@@ -113,9 +113,9 @@
     <h2>The flywheel</h2>
     <div class="grid">
       <div class="tile"><h3>1. Trade</h3><p>Every swap in the $DEEZ/$IMD Uniswap v4 pool passes through the DEEZ hook. The hook takes exactly 2% of the $IMD side: from what you pay on a buy, from what you receive on a sell. The $DEEZ token itself is a plain ERC-20 with no transfer tax.</p></div>
-      <div class="tile"><h3>2. Accumulate</h3><p>The fee is held inside the PoolManager as an ERC-6909 claim. Anyone can call <code>harvest()</code> on the hook to move the accumulated $IMD into the rewards contract. It lands in the current daily epoch's pot.</p></div>
-      <div class="tile"><h3>3. Snapshot</h3><p>At the end of each UTC day the token's own balance history fixes who held what. The pool, the burn address and the protocol contracts are excluded; every other wallet counts, with no top-N cutoff.</p></div>
-      <div class="tile"><h3>4. Claim</h3><p>Your share of a day's pot is <code>pot × your balance ÷ eligible supply</code>. Anyone can trigger a claim for any wallet; the $IMD always goes to the holder. Shares unclaimed for a year are recycled into the current pot.</p></div>
+      <div class="tile"><h3>2. Accumulate</h3><p>The fee is held inside the PoolManager as an ERC-6909 claim, recorded against the UTC day it was traded in. Anyone can call <code>harvest()</code> on the hook to move the accumulated $IMD into the rewards contract; each day's fees land in that day's pot, whenever the harvest happens.</p></div>
+      <div class="tile"><h3>3. Weigh</h3><p>At the end of each UTC day the token's own balance history fixes each wallet's average balance over the day. The pool, the burn address and the protocol contracts are excluded; every other wallet counts, with no top-N cutoff.</p></div>
+      <div class="tile"><h3>4. Claim</h3><p>Your share of a day's pot is <code>pot × your average balance ÷ eligible supply</code>. You claim your own share from your own wallet; the $IMD goes to you. Shares unclaimed for 90 days are recycled into the current pot.</p></div>
     </div>
   </section>
 
@@ -125,22 +125,22 @@
     <div class="grid">
       <div>
         <pre><b>epoch</b>            = floor(timestamp / 86400)
-<b>snapshot(e)</b>      = (e + 1) · 86400 − 1          <i>// last second of the day</i>
+<b>avg(who, e)</b>      = average balance of <i>who</i> over day e   <i>// from the token's own history</i>
 <b>eligible(e)</b>      = totalSupply
-                   − balanceAt(PoolManager, snapshot)
-                   − balanceAt(0x…dEaD, snapshot)
-                   − balanceAt(hook, snapshot)
-                   − balanceAt(rewards, snapshot)
-<b>share(you, e)</b>    = pot(e) · balanceAt(you, snapshot) / eligible(e)</pre>
+                   − avg(PoolManager, e)
+                   − avg(0x…dEaD, e)
+                   − avg(hook, e)
+                   − avg(rewards, e)
+<b>share(you, e)</b>    = pot(e) · avg(you, e) / eligible(e)</pre>
       </div>
       <div>
-        <p style="color:var(--dim);margin:0 0 14px">Every number is a public read: <code>balanceAt</code> is <code>DeezToken.getPastBalanceOf</code>, <code>pot(e)</code> is <code>DeezRewards.pots(e)</code>, and <code>DeezRewards.claimable(you, e)</code> returns the share directly. Fees are credited to the epoch in which they are harvested, so harvesting often keeps rewards close to the trades that earned them.</p>
+        <p style="color:var(--dim);margin:0 0 14px">Every number is a public read: <code>avg</code> is <code>DeezRewards.weightOf(who, e)</code> (from <code>DeezToken.getCumulativeBalanceOf</code>), <code>pot(e)</code> is <code>DeezRewards.pots(e)</code>, and <code>DeezRewards.claimable(you, e)</code> returns the share directly. Fees are credited to the day they were traded in, and a wallet that holds for one block of a day earns one block's worth of that day.</p>
         <table>
           <tr><th>Fee</th><td>2.00% of the $IMD side of every swap (hook constant, not changeable)</td></tr>
           <tr><th>Epoch</th><td>1 day (UTC)</td></tr>
-          <tr><th>Claim window</th><td>365 epochs, then the remainder is recycled to current holders</td></tr>
+          <tr><th>Claim window</th><td>90 epochs, then the remainder is recycled to current holders</td></tr>
           <tr><th>Excluded</th><td>PoolManager (the pool), 0x…dEaD, the hook, the rewards contract</td></tr>
-          <tr><th>Who can trigger</th><td>Anyone: <code>harvest()</code>, <code>accrue()</code>, <code>claim(holder, epochs)</code>, <code>recycle(epoch)</code></td></tr>
+          <tr><th>Who can trigger</th><td>Anyone: <code>harvest()</code>, <code>harvestEpochs(epochs)</code>, <code>accrue()</code>, <code>recycle(epoch)</code>. The holder itself: <code>claim(holder, epochs)</code></td></tr>
         </table>
       </div>
     </div>
@@ -165,8 +165,8 @@
         <ol>
           <li>Open the rewards contract on Etherscan and read <code>currentEpoch()</code>.</li>
           <li>For any ended epoch, read <code>claimable(yourAddress, epoch)</code>.</li>
-          <li>Write <code>claim(yourAddress, [epochs…])</code> from any wallet; the $IMD is sent to <code>yourAddress</code>.</li>
-          <li>If the pot looks small, call <code>harvest()</code> on the hook first: it moves collected fees into the current epoch.</li>
+          <li>Write <code>claim(yourAddress, [epochs…])</code> from that same wallet; the $IMD is sent to <code>yourAddress</code>.</li>
+          <li>If the pot looks small, call <code>harvest()</code> on the hook first: it moves the collected fees of today and yesterday into their epochs (<code>harvestEpochs</code> for older days).</li>
         </ol>
       </div>
     </div>
@@ -200,7 +200,7 @@
     <table>
       <tr><th>88%</th><td>880,000,000 $DEEZ seeded single-sided into the Uniswap v4 pool by the launch factory, held by the factory's position.</td></tr>
       <tr><th>10%</th><td>100,000,000 $DEEZ to the IMD swarm, through the launch's Merkle distributor.</td></tr>
-      <tr><th>2%</th><td>20,000,000 $DEEZ to the requester, of which at least 10,000,000 $DEEZ (1% of supply) is sent to the liquidity lock and locked as permanent liquidity: <code>DeezLiquidityLock.lock()</code> adds it to the pool as a position nothing can ever withdraw.</td></tr>
+      <tr><th>2%</th><td>20,000,000 $DEEZ to the requester, of which at least 10,000,000 $DEEZ (1% of supply) is sent to the liquidity lock and locked as permanent liquidity: <code>DeezLiquidityLock.lockAs(mode, minTick, maxTick)</code> adds it to the pool as a position nothing can ever withdraw.</td></tr>
     </table>
     <p style="color:var(--dim);margin:18px 0 0">Circulating supply is everything outside the pool and the lock. Tokens inside the pool earn nothing; every other wallet earns in proportion to its balance. The lock's status (<code>totalLocked0</code>, <code>totalLocked1</code>) is public on the lock contract.</p>
   </section>

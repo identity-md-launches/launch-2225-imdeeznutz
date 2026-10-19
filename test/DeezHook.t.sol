@@ -214,7 +214,110 @@ abstract contract DeezHookTests is DeezBase {
         assertEq(hookClaims(), fee);
     }
 
+    // ------------------------------------------------------- partial fills
+
+    function test_exactOutputSellBeyondThePoolsImdReverts() public {
+        // The launch pool holds $DEEZ only: an exact-output sell of $IMD cannot be filled at all. Before the fix
+        // the trader paid 2/98 of the request in $IMD for nothing; now the swap reverts.
+        seedTokenOnly(1_000_000 ether);
+        imd.mint(address(swapper), 10_000 ether);
+        uint256 imdBefore = imd.balanceOf(address(swapper));
+        uint256 deezBefore = token.balanceOf(address(swapper));
+        vm.expectRevert(); // PartialFill, wrapped by the PoolManager's hook call
+        sell(int256(1_000 ether));
+        assertEq(imd.balanceOf(address(swapper)), imdBefore);
+        assertEq(token.balanceOf(address(swapper)), deezBefore);
+        assertEq(hook.pendingFees(), 0);
+    }
+
+    function test_exactOutputSellThatFillsOnlyPartOfTheRequestReverts() public {
+        // A balanced pool with less $IMD than asked: the pool would pay out what it has and the hook's up-front
+        // fee would be on the full request. Refused.
+        seedBalanced(1_000 ether); // tiny liquidity: about 1000 $IMD at most
+        vm.expectRevert();
+        sell(int256(5_000 ether));
+        assertEq(hook.pendingFees(), 0);
+    }
+
+    function test_exactInputBuyStoppedByThePriceLimitReverts() public {
+        seedTokenOnly(1_000_000 ether);
+        imd.mint(address(swapper), 10_000 ether);
+        int24 limitTick = tokenIsCurrency0 ? int24(TICK_SPACING + 5) : int24(-TICK_SPACING - 5);
+        uint160 limit = TickMath.getSqrtPriceAtTick(limitTick);
+        uint256 imdBefore = imd.balanceOf(address(swapper));
+        vm.expectRevert();
+        swapper.swapWithLimit(key, !tokenIsCurrency0, -int256(1_000 ether), limit);
+        assertEq(imd.balanceOf(address(swapper)), imdBefore, "nothing charged");
+        assertEq(hook.pendingFees(), 0);
+        // The same buy with a limit the pool can reach fills in full and pays exactly 2%.
+        uint160 wide = tokenIsCurrency0 ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1;
+        swapper.swapWithLimit(key, !tokenIsCurrency0, -int256(1_000 ether), wide);
+        assertEq(imdBefore - imd.balanceOf(address(swapper)), 1_000 ether);
+        assertEq(hook.pendingFees(), 1_000 ether * FEE_BPS / BPS);
+    }
+
+    function test_exactOutputSellStoppedByThePriceLimitReverts() public {
+        seedBalanced(1_000_000 ether);
+        int24 limitTick = tokenIsCurrency0 ? int24(-5) : int24(5);
+        uint160 limit = TickMath.getSqrtPriceAtTick(limitTick);
+        vm.expectRevert();
+        swapper.swapWithLimit(key, tokenIsCurrency0, int256(1_000 ether), limit);
+        assertEq(hook.pendingFees(), 0);
+    }
+
+    function test_deezSpecifiedPartialFillsAreChargedOnWhatActuallyTraded() public {
+        // When $DEEZ is specified the fee is read from the realised $IMD delta, so a partial fill is simply a
+        // smaller trade with a 2% fee on it.
+        seedBalanced(1_000_000 ether);
+        int24 limitTick = tokenIsCurrency0 ? int24(-5) : int24(5);
+        uint160 limit = TickMath.getSqrtPriceAtTick(limitTick);
+        uint256 imdBefore = imd.balanceOf(address(swapper));
+        swapper.swapWithLimit(key, tokenIsCurrency0, -int256(100_000 ether), limit); // exact-input sell
+        uint256 received = imd.balanceOf(address(swapper)) - imdBefore;
+        uint256 fee = hook.pendingFees();
+        assertGt(received, 0);
+        assertEq(fee, (received + fee) * FEE_BPS / BPS, "2% of the gross output actually paid");
+    }
+
     // ------------------------------------------------------------- harvest
+
+    function test_feesAreRecordedAgainstTheEpochTheyWereTradedIn() public {
+        seedBalanced(1_000_000 ether);
+        vm.warp(1_000 * 1 days + 100);
+        buy(-1_000 ether);
+        uint256 first = hook.pendingFees();
+        vm.warp(1_001 * 1 days + 100);
+        sell(-500 ether);
+        uint256 second = hook.pendingFees() - first;
+        assertEq(hook.pendingFeesOf(1_000), first);
+        assertEq(hook.pendingFeesOf(1_001), second);
+        hook.harvest(); // current and previous epoch
+        assertEq(hook.pendingFees(), 0);
+        (uint128 pot1000,,,) = rewards.pots(1_000);
+        (uint128 pot1001,,,) = rewards.pots(1_001);
+        assertEq(pot1000, first, "fees traded in epoch 1000 belong to epoch 1000, whenever harvested");
+        assertEq(pot1001, second);
+        assertEq(rewards.reserved(), first + second);
+    }
+
+    function test_oldEpochsAreHarvestedByNumber() public {
+        seedBalanced(1_000_000 ether);
+        vm.warp(1_000 * 1 days);
+        buy(-1_000 ether);
+        uint256 fees = hook.pendingFees();
+        vm.warp(1_010 * 1 days);
+        assertEq(hook.harvest(), 0, "harvest() only covers the current and previous epoch");
+        assertEq(hook.pendingFeesOf(1_000), fees);
+        uint256[] memory epochs = new uint256[](1);
+        epochs[0] = 1_000;
+        vm.prank(address(0xCAFE));
+        assertEq(hook.harvestEpochs(epochs), fees);
+        (uint128 pot,,,) = rewards.pots(1_000);
+        assertEq(pot, fees);
+        assertEq(hook.pendingFees(), 0);
+        assertEq(hookClaims(), 0);
+        assertEq(hook.harvestEpochs(epochs), 0, "nothing left for that epoch");
+    }
 
     function test_harvestMovesFeesToTheDistributorAndCreditsTheEpoch() public {
         seedBalanced(1_000_000 ether);

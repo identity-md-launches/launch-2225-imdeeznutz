@@ -81,9 +81,73 @@ contract DeezTokenTest is Test {
         assertEq(token.getPastBalanceOf(address(this), 1_000_000), 1e27);
         assertEq(token.getPastBalanceOf(address(this), 1_000_250), 1e27 - 150 ether);
         assertEq(token.numCheckpoints(alice), 2);
-        (uint48 at, uint256 bal) = token.checkpointAt(alice, 1);
+        (uint48 at, uint256 bal, uint256 cumulative) = token.checkpointAt(alice, 1);
         assertEq(at, 1_000_200);
         assertEq(bal, 130 ether);
+        assertEq(cumulative, uint256(100 ether) * 100 / 1 days, "100 DEEZ for 100 seconds, in wei-days");
+    }
+
+    function test_cumulativeBalanceIntegratesHoldingTime() public {
+        // Deployed at t = 1_000_000 with the whole supply.
+        vm.warp(1_000_000 + 1 days);
+        token.transfer(alice, 100 ether); // alice holds 100 from day 1 on
+        vm.warp(1_000_000 + 2 days);
+        token.transfer(alice, 100 ether); // 200 from day 2 on
+        vm.warp(1_000_000 + 3 days);
+        vm.prank(alice);
+        token.transfer(bob, 200 ether); // 0 from day 3 on
+        vm.warp(1_000_000 + 4 days);
+
+        uint256 t0 = 1_000_000;
+        assertEq(token.getCumulativeBalanceOf(alice, t0), 0);
+        assertEq(token.getCumulativeBalanceOf(alice, t0 + 1 days), 0, "nothing held before day 1");
+        assertEq(token.getCumulativeBalanceOf(alice, t0 + 2 days), 100 ether, "100 for one day");
+        assertEq(token.getCumulativeBalanceOf(alice, t0 + 3 days), 300 ether, "plus 200 for one day");
+        assertEq(token.getCumulativeBalanceOf(alice, t0 + 4 days), 300 ether, "nothing since day 3");
+        assertEq(token.getCumulativeBalanceOf(alice, t0 + 2 days + 12 hours), 200 ether, "half a day at 200");
+        assertEq(token.getCumulativeBalanceOf(bob, t0 + 4 days), 200 ether);
+        // The average balance over day 2 is the difference of the cumulatives at its ends.
+        uint256 start = t0 + 2 days;
+        assertEq(
+            token.getCumulativeBalanceOf(alice, start + 1 days) - token.getCumulativeBalanceOf(alice, start), 200 ether
+        );
+        // The deployer held everything until its transfers; total supply integrates from the mint.
+        assertEq(token.mintedAt(), t0);
+        assertEq(token.getCumulativeTotalSupply(t0), 0);
+        assertEq(token.getCumulativeTotalSupply(t0 + 4 days), 4 * 1e27);
+        assertEq(
+            token.getCumulativeBalanceOf(address(this), t0 + 4 days) + token.getCumulativeBalanceOf(alice, t0 + 4 days)
+                + token.getCumulativeBalanceOf(bob, t0 + 4 days),
+            token.getCumulativeTotalSupply(t0 + 4 days),
+            "the cumulatives of all holders add up to the cumulative supply"
+        );
+    }
+
+    function test_cumulativeBalanceAllowsTheCurrentSecondButNotTheFuture() public view {
+        assertEq(token.getCumulativeBalanceOf(address(this), 1_000_000), 0, "the current second is not counted yet");
+    }
+
+    function test_cumulativeBalanceRefusesTheFuture() public {
+        vm.expectRevert(abi.encodeWithSelector(DeezToken.FutureLookup.selector, uint48(1_000_001), uint48(1_000_000)));
+        token.getCumulativeBalanceOf(alice, 1_000_001);
+        vm.expectRevert(abi.encodeWithSelector(DeezToken.FutureLookup.selector, uint48(1_000_001), uint48(1_000_000)));
+        token.getCumulativeTotalSupply(1_000_001);
+    }
+
+    function testFuzz_cumulativeBalanceMatchesHoldingTime(uint96 a, uint32 gap1, uint32 gap2) public {
+        a = uint96(bound(a, 1, 1e27 / 2));
+        gap1 = uint32(bound(gap1, 1, 365 days));
+        gap2 = uint32(bound(gap2, 1, 365 days));
+        uint256 t1 = 2_000_000;
+        vm.warp(t1);
+        token.transfer(alice, a);
+        vm.warp(t1 + gap1);
+        vm.prank(alice);
+        token.transfer(bob, a);
+        vm.warp(t1 + gap1 + gap2);
+        uint256 expected = uint256(a) * gap1 / 1 days;
+        assertEq(token.getCumulativeBalanceOf(alice, t1 + gap1 + gap2), expected, "a for gap1 seconds");
+        assertEq(token.getCumulativeBalanceOf(bob, t1 + gap1 + gap2), uint256(a) * gap2 / 1 days);
     }
 
     function test_pastBalanceRefusesTheCurrentSecondAndTheFuture() public {

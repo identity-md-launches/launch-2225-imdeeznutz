@@ -94,6 +94,59 @@ abstract contract DeezLiquidityLockTests is DeezBase {
         );
     }
 
+    function test_lockAsSingleSidedIgnoresDustOnTheOtherSide() public {
+        // The griefing case from the review: 1 wei of the other token sent before the call. With an explicit
+        // mode the whole 10,000,000 $DEEZ still becomes a single-sided position, and the dust stays behind.
+        seedBalanced(1_000_000 ether);
+        token.transfer(address(lock), 10_000_000 ether);
+        imd.mint(address(lock), 1);
+        DeezLiquidityLock.Mode mode =
+            tokenIsCurrency0 ? DeezLiquidityLock.Mode.Token0Only : DeezLiquidityLock.Mode.Token1Only;
+        uint128 liquidity = lock.lockAs(mode, -10, 10);
+        assertGt(liquidity, 1);
+        assertLt(token.balanceOf(address(lock)), 10_000_000 ether / 100_000, "all but dust locked");
+        assertEq(imd.balanceOf(address(lock)), 1, "the other side was left alone");
+        (int24 lower, int24 upper) = tokenIsCurrency0
+            ? (int24(TICK_SPACING), TickMath.maxUsableTick(TICK_SPACING))
+            : (TickMath.minUsableTick(TICK_SPACING), int24(0));
+        assertEq(rangeLiquidity(lower, upper), liquidity);
+    }
+
+    function test_lockAsRefusesAPriceOutsideTheCallersBounds() public {
+        seedBalanced(1_000_000 ether);
+        token.transfer(address(lock), 10_000_000 ether);
+        sell(-5_000 ether); // moves the price away from tick 0
+        (, int24 tick,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        assertTrue(tick != 0);
+        vm.expectRevert(abi.encodeWithSelector(DeezLiquidityLock.TickOutOfBounds.selector, tick, -10, 10));
+        lock.lockAs(DeezLiquidityLock.Mode.Auto, -10, 10);
+        assertEq(token.balanceOf(address(lock)), 10_000_000 ether, "nothing locked");
+    }
+
+    function test_lockAsFullRangeAndTheLeftoverSingleSided() public {
+        seedBalanced(1_000_000 ether);
+        token.transfer(address(lock), 10_000_000 ether);
+        imd.mint(address(lock), 1_000 ether);
+        uint128 full = lock.lockAs(DeezLiquidityLock.Mode.FullRange, TickMath.MIN_TICK, TickMath.MAX_TICK);
+        assertEq(rangeLiquidity(TickMath.minUsableTick(TICK_SPACING), TickMath.maxUsableTick(TICK_SPACING)), full);
+        assertLt(imd.balanceOf(address(lock)), 1 ether, "the scarcer side is used up");
+        assertGt(token.balanceOf(address(lock)), 9_000_000 ether, "the rest of the DEEZ waits");
+        DeezLiquidityLock.Mode mode =
+            tokenIsCurrency0 ? DeezLiquidityLock.Mode.Token0Only : DeezLiquidityLock.Mode.Token1Only;
+        uint128 single = lock.lockAs(mode, TickMath.MIN_TICK, TickMath.MAX_TICK);
+        assertGt(single, 0);
+        assertLt(token.balanceOf(address(lock)), 10_000_000 ether / 100_000, "then locked single-sided in one call");
+    }
+
+    function test_lockAsRefusesAnEmptySide() public {
+        seedBalanced(1_000_000 ether);
+        imd.mint(address(lock), 1_000 ether);
+        DeezLiquidityLock.Mode deezOnly =
+            tokenIsCurrency0 ? DeezLiquidityLock.Mode.Token0Only : DeezLiquidityLock.Mode.Token1Only;
+        vm.expectRevert(DeezLiquidityLock.NothingToLock.selector);
+        lock.lockAs(deezOnly, TickMath.MIN_TICK, TickMath.MAX_TICK);
+    }
+
     function test_lockedLiquidityCannotBeRemoved() public {
         seedBalanced(1_000_000 ether);
         token.transfer(address(lock), 10_000 ether);
