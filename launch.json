@@ -1,0 +1,31 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "DeezHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$token",
+      "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "DeezToken",
+    "name": "IMDeezNutz",
+    "symbol": "DEEZ",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "DeezToken: fixed-supply OpenZeppelin ERC-20 (IMDeezNutz, DEEZ, 18 decimals), no constructor arguments, the whole supply minted once to msg.sender (the launch factory). No owner, mint, burn, pause, blocklist or proxy; its only addition is a timestamp checkpoint per balance change that also keeps a cumulative balance (token-days), read by getPastBalanceOf, getCumulativeBalanceOf and getCumulativeTotalSupply so rewards can be weighted by the balance actually held over an epoch. DeezHook constructor: (IPoolManager poolManager_ = $poolManager, address token_ = $token, address pairedCurrency_ = IMD 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7). It has no owner argument: nothing in this launch has an owner or admin, so $owner only receives the policy's 2% payer share. The constructor deploys two further contracts, DeezRewards (hook.rewards()) and DeezLiquidityLock (hook.liquidityLock()). Permissions match getHookPermissions exactly: beforeInitialize, beforeSwap, afterSwap, beforeSwapReturnDelta, afterSwapReturnDelta (flags 0x20CC); no liquidity or donate callbacks, so the factory's zero-liquidity fee collect is never intercepted. beforeInitialize accepts only the PoolManager as caller and only the first pool whose currencies are {DEEZ, IMD}, from any initializer (the factory included), at any fee tier and tick spacing, so pool.fee 12500 (the launch policy's 1.25% LP fee, split 80/20 payer/network) and tickSpacing 60 are accepted; the hook's 2% comes on top of the LP fee. Fee: FEE_BPS = 200, exactly 2.00% of the IMD side of every buy and sell (exact-input and exact-output), never taken from DEEZ. When IMD is the specified currency the fee is returned from beforeSwap, otherwise from afterSwap; in afterSwap it is minted to the hook as an ERC-6909 claim (poolManager.mint), so no IMD balance in the PoolManager is needed and a buy on the freshly seeded pool cannot revert. An IMD-specified swap the pool fills only partly reverts with PartialFill, so the up-front fee can never exceed 2% of what traded. The brief asks for rewards in IMD, so the fee is kept and paid in IMD rather than sold for ETH. Fees are recorded against the daily reward epoch they were traded in (pendingFeesOf[epoch]); harvest() (anyone) unlocks the manager, burns the claims, moves the IMD into DeezRewards and credits the current and previous epoch's pots; harvestEpochs(epochs) does the same for any epochs. DeezRewards: epochs are UTC days; weightOf(account, epoch) is the account's average balance over the epoch from the token's cumulative history; eligibleSupplyAt(epoch) is the same for the whole supply minus the PoolManager (where the pool's DEEZ lives), 0x...dEaD, the hook and the distributor itself; claimable = (pot + hook.pendingFeesOf(epoch)) x weight / eligibleSupply - paidOf[epoch][account]. finalize(epoch) is permissionless once the epoch ended; claim(account, epochs) is callable only by the account itself (nonReentrant), first calls hook.harvestEpochs(epochs) so fees of the day still held as claims are credited before the share is computed, and records paidOf, so a repeat claim pays only what the pot gained since; a claim that pays nothing in total reverts. recycle(epoch) folds what was not claimed within CLAIM_WINDOW = 90 epochs into the current pot. DeezLiquidityLock: anyone may send DEEZ and/or IMD and call lock() or lockAs(mode, minTick, maxTick) (Auto, Token0Only, Token1Only, FullRange) to mint a permanent position in the launch pool with no remove and no fee-collect function; the requester locks at least 10,000,000 DEEZ of the 2% there after launch. Every callback and both unlockCallbacks require msg.sender == poolManager. pool.initialPrice is written as the launch facts give it; the deployer derives the opening price from the policy's 2,500 IMD opening market cap and the currency order. Supply, split and allocations are the factory's and are not manifest fields."
+}
